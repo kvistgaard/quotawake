@@ -2,7 +2,8 @@
 
 Auto-resumes **Claude Code** work across usage-limit resets. Claude Code has no
 event that fires on "usage limit reached" and no built-in resume when the window
-reopens — this fills that gap, on Windows, with no resident process.
+reopens — this fills that gap on **Windows, macOS and Linux**, with no resident
+process.
 
 Two independent things live here:
 
@@ -16,6 +17,47 @@ Two independent things live here:
 > `pending-sessions.json` exist **only while something is actually waiting for a
 > reset**, and are deleted the moment it completes. Not seeing them is the normal,
 > healthy state — it means nothing is pending, not that anything is broken.
+
+## Platforms
+
+Everything OS-specific sits behind one narrow contract — register a job, remove
+it, ask whether it exists — with three backends:
+
+| | Windows | macOS | Linux |
+|---|---|---|---|
+| Scheduling | Task Scheduler | launchd (`~/Library/LaunchAgents`) | `systemd --user` timers |
+| Fires after sleep/off | `StartWhenAvailable` | launchd catch-up on wake | `Persistent=true` |
+| Notification | WinRT toast / BurntToast | `osascript` | `notify-send` |
+| Keep-awake | `SetThreadExecutionState` | `caffeinate -s` | `systemd-inhibit` |
+| AC detection | WinForms `PowerStatus` | `pmset -g batt` | `/sys/class/power_supply` |
+| Autostart | Startup-folder shim | LaunchAgent (`KeepAlive`) | user service (`Restart=always`) |
+
+**Verification status — read this before trusting it.**
+
+- **Windows** is fully exercised: unit tests plus repeated live rescues.
+- **Linux** unit generation is verified against real `systemd-analyze` (v245):
+  the `.timer` and `.service` files are accepted with no complaints, and the
+  `OnCalendar` value normalises to the intended instant. The `systemctl` calls
+  themselves are not exercised here.
+- **macOS is unverified.** It was written against launchd's documented
+  behaviour and its plist generation is unit-tested (well-formed XML, correct
+  label, calendar fields, `RunAtLoad`), but no Mac was available to run it.
+
+Because of that, every platform ships with a self-check that proves the
+integration where it actually runs, including a real register/unregister
+round-trip against the live scheduler:
+
+```powershell
+./quotawake.ps1 -Doctor
+```
+
+Run it first on any new machine. If the scheduler line fails, nothing will ever
+fire — and that failure is otherwise silent.
+
+**One deliberate non-goal:** nothing here wakes a sleeping machine. That needs
+wake timers on Windows (AC-only under typical laptop policy) and root on
+macOS/Linux. A rescue whose moment passes while the machine is asleep runs at
+the next wake instead — delayed, never lost.
 
 ## Timing: why nothing stays running
 
@@ -107,19 +149,23 @@ redoes finished work; it cost a duplicated pass on 2026-07-31.
 
 That binds the tool to wherever the script currently sits, and is the only step:
 
-- registers the `QuotaWake-Logon` scheduled task (logon + every 15 min, hidden),
-- adds the folder to your **user PATH**, dropping any stale `quotawake` entry,
+- registers the 15-minute reconciler with the platform's scheduler,
 - writes the `qw` shortcut into `$PROFILE.CurrentUserAllHosts`,
-- writes the keep-awake watcher's autostart stub into your Startup folder.
+- installs the keep-awake watcher's autostart,
+- **Windows only:** adds the folder to your user PATH, dropping stale entries.
 
-Open a **new** shell afterwards for PATH and `qw` to take effect, and start the
-watcher without waiting for a logon:
+Open a **new** shell afterwards for `qw` to take effect, then confirm the
+integration actually works on this machine:
 
 ```powershell
-wscript "$([Environment]::GetFolderPath('Startup'))\quotawake-keepawake.vbs"
+./quotawake.ps1 -Doctor
 ```
 
-`-Uninstall` reverses all four, plus the state files.
+`-Uninstall` reverses all of it, plus the state files.
+
+On Linux, user services and timers are torn down at logout unless lingering is
+enabled; `-Install` attempts `loginctl enable-linger` but that usually needs
+polkit or root. If `-Doctor` still passes after you log out and back in, it took.
 
 ### Moving the folder (or cloning it somewhere new)
 
@@ -204,10 +250,13 @@ notice anyway.
 - **One pending wrapper resume at a time.** The state file and one-shot task are
   singletons; arming a new resume replaces the previous one. (Session rescue
   handles many sessions per batch.)
-- **On battery, a resume is delayed, never lost.** Wake timers are policy-enabled
-  on AC and disabled on battery here — deliberately, to keep battery economic. So
-  on battery `WakeToRun` cannot wake the machine; the resume fires the moment you
-  next wake it, or at the next reconcile pass.
+- **A sleeping machine delays a resume, never loses it.** Nothing here wakes a
+  sleeping machine: Windows needs wake timers (policy-enabled on AC, disabled on
+  battery on most laptops — deliberately, to keep battery economic) and
+  macOS/Linux need root. The resume fires the moment the machine is next awake,
+  or at the following reconcile pass.
+- **macOS is untested.** Written to launchd's documented behaviour with its
+  plist generation unit-tested, but never run on a Mac. Run `-Doctor` first.
 
 ## Exit codes
 
@@ -220,11 +269,18 @@ otherwise Claude's own non-zero exit code.
 pwsh -File quotawake.Tests.ps1
 ```
 
-79 assertions against a mocked `claude` and mocked task registration — no real
+100 assertions against a mocked `claude` and mocked task registration — no real
 runs, no task registered, no quota spent. Covers limit detection, reset-time
 parsing (including anchored parsing), `-At` parsing, state round-trips, the full
 round logic, stranded-session detection (including the regressions that once made
-rescue fail silently), the arming/holding/firing cycle, and the notice and toast.
+rescue fail silently), the arming/holding/firing cycle, the notice and toast, and
+the launchd/systemd generators.
+
+The OS-specific backends are written as **pure generators** returning plist and
+unit text, so the part most likely to be wrong is testable from any machine. The
+generated systemd units are additionally validated by a real `systemd-analyze
+verify`. What unit tests cannot reach — the actual `launchctl` and `systemctl`
+calls — is what `-Doctor` exists to check on the target machine.
 
 ## Why it works the way it does
 
