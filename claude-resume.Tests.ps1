@@ -128,7 +128,7 @@ $quotedLine = '{"type":"user","timestamp":"2026-07-18T19:00:00.000Z","message":{
 $beforeReset = '{"type":"user","timestamp":"2026-07-18T18:00:00.000Z","message":{"role":"user","content":"what is this session id?"},"sessionId":"aaaa-1111","cwd":"C:\\proj"}'
 # Chat after the reset is NOT recovery — this is the 2026-07-31 shape exactly:
 # a plain answer to an unrelated question, 81s past the reset, work untouched.
-$afterChat   = '{"type":"assistant","timestamp":"2026-07-18T20:30:00.000Z","message":{"role":"assistant","content":[{"type":"text","text":"`session_01JuvHNTdkxRRkUcb1bzzFs9`"}]},"sessionId":"aaaa-1111","cwd":"C:\\proj"}'
+$afterChat   = '{"type":"assistant","timestamp":"2026-07-18T20:30:00.000Z","message":{"role":"assistant","content":[{"type":"text","text":"`session_0EXAMPLE0000000000000000`"}]},"sessionId":"aaaa-1111","cwd":"C:\\proj"}'
 # Tool use after the reset IS recovery — the agent is executing again.
 $afterWork   = '{"type":"assistant","timestamp":"2026-07-18T20:30:00.000Z","message":{"role":"assistant","content":[{"type":"tool_use","name":"Edit","input":{}}]},"sessionId":"aaaa-1111","cwd":"C:\\proj"}'
 
