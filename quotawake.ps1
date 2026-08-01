@@ -29,10 +29,10 @@
   An open TUI on an awake machine auto-continues ~3 min after the reset — but a
   closed or abandoned session stays dead forever. So every -Reconcile pass also
   scans recent transcripts for sessions *stranded* on a rate-limit stop, arms a
-  one-shot task (ClaudeResume-FireSessions) for reset+buffer, and then resumes
+  one-shot task (QuotaWake-FireSessions) for reset+buffer, and then resumes
   each stranded conversation headlessly: `claude --resume <sessionId> -p ...`
   run in the session's own project folder. State: pending-sessions.json (also
-  watched by keep-awake-claude.ps1); handled stops: resumed-sessions.json.
+  watched by keep-awake.ps1); handled stops: resumed-sessions.json.
 
 .NOTES
   - Headless only (`claude -p`); it cannot type into a live interactive TUI.
@@ -42,20 +42,20 @@
     in .claude/settings.json; headless claude cannot approve its own actions.
   - Exit codes: 0 done · 2 bad -At · 4 hit MaxRounds · 5 resume armed ·
     otherwise claude's own non-zero exit code.
-  - -SelfTest defines the functions and returns, for claude-resume.Tests.ps1.
+  - -SelfTest defines the functions and returns, for quotawake.Tests.ps1.
 
 .EXAMPLES
   # One-time setup: create the logon reconciler ("startup service"):
-  .\claude-resume.ps1 -Install
+  .\quotawake.ps1 -Install
 
   # Fire-and-forget a task; on a limit it arms the scheduled resume and exits:
-  .\claude-resume.ps1 -Task "revise the note per my inline comments" -PermissionMode acceptEdits
+  .\quotawake.ps1 -Task "revise the note per my inline comments" -PermissionMode acceptEdits
 
   # Resume the most recent conversation (arms itself the same way if limited):
-  .\claude-resume.ps1 -Continue
+  .\quotawake.ps1 -Continue
 
   # Pre-schedule: arm the resume for a time you saw on screen, and exit:
-  .\claude-resume.ps1 -Continue -At "3pm"
+  .\quotawake.ps1 -Continue -At "3pm"
 #>
 
 param(
@@ -115,13 +115,13 @@ try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch {}
 
 $ScriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
 $script:StateFile = Join-Path $ScriptDir "pending-resume.json"
-$FireTaskName  = "ClaudeResume-Fire"
-$LogonTaskName = "ClaudeResume-Logon"
+$FireTaskName  = "QuotaWake-Fire"
+$LogonTaskName = "QuotaWake-Logon"
 $HiddenLauncher = Join-Path $ScriptDir "run-hidden.vbs"
-$script:logFile = Join-Path $Project "claude-resume.log"
+$script:logFile = Join-Path $Project "quotawake.log"
 
 # --- interactive-session rescue (see the region of the same name below) ---
-$SessionsFireTaskName         = "ClaudeResume-FireSessions"
+$SessionsFireTaskName         = "QuotaWake-FireSessions"
 $script:SessionsStateFile     = Join-Path $ScriptDir "pending-sessions.json"
 $script:ProcessedSessionsFile = Join-Path $ScriptDir "resumed-sessions.json"
 $script:RescueLockFile        = Join-Path $ScriptDir ".session-rescue.lock"
@@ -136,7 +136,7 @@ $SessionPermissionMode  = "acceptEdits"
 # learns the work is finished is to find the evidence where they are already
 # looking. An invisible success reads exactly like a failure — that is what made
 # this tool look broken for weeks, and cost a duplicated run on 2026-07-31.
-$SessionNoticeFile      = "CLAUDE-RESUMED.md"
+$SessionNoticeFile      = "QUOTAWAKE-RESUMED.md"
 # How long a reconcile pass waits for a dispatched agent before writing the
 # notice anyway. Timing out is not a failure — the agent keeps running and stays
 # visible in `claude agents`; only the notice's "Result" line gets vaguer.
@@ -633,7 +633,7 @@ $n = $x.GetElementsByTagName('text')
 $n.Item(0).AppendChild($x.CreateTextNode('__T__')) | Out-Null
 $n.Item(1).AppendChild($x.CreateTextNode('__B__')) | Out-Null
 $toast = [Windows.UI.Notifications.ToastNotification]::new($x)
-[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('claude-resume').Show($toast)
+[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('quotawake').Show($toast)
 '@
       $inner = $inner.Replace('__T__', $t).Replace('__B__', $b)
       $enc = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($inner))
@@ -817,7 +817,7 @@ function Invoke-SessionReconcile {
     Add-ProcessedSession $h.SessionId $h.LimitTs
     if ($r.Code -ne 0 -or -not $r.BgId) {
       Log ("session-rescue: {0} dispatch failed (exit {1}) - see output above; not retrying." -f $h.SessionId, $r.Code)
-      $result = "dispatch failed (exit $($r.Code)) — see claude-resume.log"
+      $result = "dispatch failed (exit $($r.Code)) — see quotawake.log"
     } else {
       # An agent that re-limits immediately strands its own transcript. Ask the
       # same detector rather than scraping text — with --bg the dispatch exits 0
@@ -905,33 +905,61 @@ function Invoke-Round([bool]$continueRun, [int]$round) {
   return 5
 }
 
-# ---------- machine bindings (PATH, crun shortcut, watcher autostart) ----------
+# ---------- machine bindings (PATH, qw shortcut, watcher autostart) ----------
 # Four things bind this tool to an absolute folder: the scheduled task, the user
-# PATH entry, the crun shortcut in the profile, and the watcher's startup stub.
+# PATH entry, the qw shortcut in the profile, and the watcher's startup stub.
 # Move the folder and every one of them breaks — silently, which is the worst
 # way for this particular tool to fail: no reconciler means no rescues, and
 # nothing anywhere says so. They are all derived from $ScriptDir and rewritten
 # idempotently, so re-running -Install from a new location IS the migration.
 
-$CrunBegin      = '# >>> claude-resume (crun) >>>'
-$CrunEnd        = '# <<< claude-resume (crun) <<<'
-$StartupVbsName = 'keep-awake-claude.vbs'
+$AliasBegin     = '# >>> quotawake (qw) >>>'
+$AliasEnd       = '# <<< quotawake (qw) <<<'
+$StartupVbsName = 'quotawake-keepawake.vbs'
+
+# Names used before this tool was renamed from claude-resume. -Install clears
+# them, because a scheduled task left pointing at a script that no longer exists
+# is this project's signature failure: it stays registered, fires on time, does
+# nothing at all, and reports nothing. A rename is exactly when that gets
+# created, so the installer has to be the thing that prevents it.
+$LegacyTaskNames  = @('ClaudeResume-Fire', 'ClaudeResume-Logon', 'ClaudeResume-FireSessions')
+$LegacyAliasBegin = '# >>> claude-resume (crun) >>>'
+$LegacyAliasEnd   = '# <<< claude-resume (crun) <<<'
+$LegacyVbsName    = 'keep-awake-claude.vbs'
+
+function Remove-LegacyInstall {
+  # Returns what it actually cleaned, so -Install can say so rather than leaving
+  # the user to wonder whether the old install is still lurking.
+  $done = @()
+  foreach ($t in $LegacyTaskNames) {
+    if (Get-ScheduledTask -TaskName $t -ErrorAction SilentlyContinue) {
+      Unregister-ScheduledTask -TaskName $t -Confirm:$false -ErrorAction SilentlyContinue
+      $done += "unregistered stale task '$t'"
+    }
+  }
+  $legacyVbs = Join-Path ([Environment]::GetFolderPath('Startup')) $LegacyVbsName
+  if (Test-Path -LiteralPath $legacyVbs) {
+    Remove-Item -LiteralPath $legacyVbs -Force -ErrorAction SilentlyContinue
+    $done += "removed stale autostart '$LegacyVbsName'"
+  }
+  return $done
+}
 
 function Get-StartupVbsPath { Join-Path ([Environment]::GetFolderPath('Startup')) $StartupVbsName }
 
 function Set-UserPathEntry([switch]$Remove) {
-  # Also drops any claude-resume folder that no longer exists — exactly what a
+  # Also drops any quotawake folder that no longer exists — exactly what a
   # move leaves behind, and a stale PATH entry is pure confusion later.
   $cur  = @(([Environment]::GetEnvironmentVariable('PATH', 'User') -split ';') | Where-Object { $_ })
   $kept = @($cur | Where-Object {
     -not (
       # this folder, so it can be re-added cleanly at the end
       $_.TrimEnd('\') -eq $ScriptDir.TrimEnd('\') -or
-      # a claude-resume folder that no longer exists: what a move leaves behind
-      ($_ -like '*claude-resume*' -and -not (Test-Path -LiteralPath $_)) -or
+      # a quotawake folder that no longer exists: what a move leaves behind
+      ($_ -like '*quotawake*' -and -not (Test-Path -LiteralPath $_)) -or
       # an older copy still on disk: after a copy-then-install the old entry
       # would otherwise survive AND could shadow this one on PATH lookup
-      (Test-Path -LiteralPath (Join-Path $_ 'claude-resume.ps1'))
+      (Test-Path -LiteralPath (Join-Path $_ 'quotawake.ps1'))
     )
   })
   $new = if ($Remove) { $kept } else { $kept + $ScriptDir }
@@ -942,24 +970,27 @@ function Set-UserPathEntry([switch]$Remove) {
   return $false
 }
 
-function Set-CrunShortcut([switch]$Remove) {
+function Set-AliasShortcut([switch]$Remove) {
   # Rewrites only the marked block, so anything else in the profile survives.
   $profilePath = $PROFILE.CurrentUserAllHosts
   $dir = Split-Path -Parent $profilePath
   if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
   $lines = @()
   if (Test-Path -LiteralPath $profilePath) { $lines = @(Get-Content -LiteralPath $profilePath) }
+  # Strips the pre-rename block as well, or the profile would end up defining
+  # both `crun` and `qw`, with crun still pointing at a script that is gone.
   $out = @(); $inBlock = $false
   foreach ($l in $lines) {
-    if ($l.Trim() -eq $CrunBegin) { $inBlock = $true; continue }
-    if ($l.Trim() -eq $CrunEnd)   { $inBlock = $false; continue }
+    $t = $l.Trim()
+    if ($t -eq $AliasBegin -or $t -eq $LegacyAliasBegin) { $inBlock = $true; continue }
+    if ($t -eq $AliasEnd   -or $t -eq $LegacyAliasEnd)   { $inBlock = $false; continue }
     if (-not $inBlock) { $out += $l }
   }
   if (-not $Remove) {
-    $out += $CrunBegin
-    $out += '# One-word shortcut to run claude-resume from any directory; forwards all args.'
-    $out += ('function crun {{ & "{0}" @args }}' -f (Join-Path $ScriptDir 'claude-resume.ps1'))
-    $out += $CrunEnd
+    $out += $AliasBegin
+    $out += '# One-word shortcut to run quotawake from any directory; forwards all args.'
+    $out += ('function qw {{ & "{0}" @args }}' -f (Join-Path $ScriptDir 'quotawake.ps1'))
+    $out += $AliasEnd
   }
   Set-Content -LiteralPath $profilePath -Value $out -Encoding UTF8
 }
@@ -967,10 +998,10 @@ function Set-CrunShortcut([switch]$Remove) {
 function Set-WatcherAutostart([switch]$Remove) {
   $vbs = Get-StartupVbsPath
   if ($Remove) { Remove-Item -LiteralPath $vbs -Force -ErrorAction SilentlyContinue; return }
-  $ps1 = Join-Path $ScriptDir 'keep-awake-claude.ps1'
+  $ps1 = Join-Path $ScriptDir 'keep-awake.ps1'
   Set-Content -LiteralPath $vbs -Encoding ASCII -Value @(
-    "' Autostarts the claude-resume keep-awake watcher, hidden (no console flash).",
-    "' Generated by claude-resume.ps1 -Install - edit that, not this file.",
+    "' Autostarts the quotawake keep-awake watcher, hidden (no console flash).",
+    "' Generated by quotawake.ps1 -Install - edit that, not this file.",
     'Dim objShell',
     'Set objShell = CreateObject("WScript.Shell")',
     ('objShell.Run "pwsh -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File ""{0}""", 0, False' -f $ps1)
@@ -986,26 +1017,29 @@ if ($Uninstall) {
   Clear-SessionsState
   Remove-Item $script:ProcessedSessionsFile, $script:RescueLockFile -Force -ErrorAction SilentlyContinue
   Unregister-ScheduledTask -TaskName $LogonTaskName -Confirm:$false -ErrorAction SilentlyContinue
-  Set-CrunShortcut -Remove
+  Set-AliasShortcut -Remove
   Set-WatcherAutostart -Remove
   [void](Set-UserPathEntry -Remove)
-  Write-Host "Removed: state files, scheduled tasks, PATH entry, crun shortcut, watcher autostart."
+  [void](Remove-LegacyInstall)
+  Write-Host "Removed: state files, scheduled tasks, PATH entry, qw shortcut, watcher autostart."
   Write-Host "A watcher already running stays up until you end it or log off."
   exit 0
 }
 
 if ($Install) {
+  $cleaned = @(Remove-LegacyInstall)
   Register-LogonTask
   $pathChanged = Set-UserPathEntry
-  Set-CrunShortcut
+  Set-AliasShortcut
   Set-WatcherAutostart
-  Write-Host "claude-resume installed from: $ScriptDir"
+  Write-Host "quotawake installed from: $ScriptDir"
+  foreach ($c in $cleaned) { Write-Host "  migrated           $c" }
   Write-Host "  scheduled task     '$LogonTaskName' (logon + every 15 min, hidden)"
   Write-Host ("  user PATH          {0}" -f $(if ($pathChanged) { "updated" } else { "already correct" }))
-  Write-Host ("  crun shortcut      {0}" -f $PROFILE.CurrentUserAllHosts)
+  Write-Host ("  qw shortcut        {0}" -f $PROFILE.CurrentUserAllHosts)
   Write-Host ("  watcher autostart  {0}" -f (Get-StartupVbsPath))
   Write-Host ""
-  Write-Host "Open a NEW shell for PATH and crun to take effect."
+  Write-Host "Open a NEW shell for PATH and qw to take effect."
   Write-Host "If you just moved the folder, end any watcher still running from the old"
   Write-Host "path, then start the new one without waiting for a logon:"
   Write-Host ("  wscript `"{0}`"" -f (Get-StartupVbsPath))
@@ -1015,7 +1049,7 @@ if ($Install) {
 if ($Resume -or $Reconcile) {
   if ($Reconcile) {
     # Interactive-session rescue runs on every reconcile pass, independent of
-    # any crun-launched pending state. The exclusive file lock keeps the 15-min
+    # any qw-launched pending state. The exclusive file lock keeps the 15-min
     # pass and the one-shot fire task from double-resuming when they collide;
     # the loser skips silently (the next pass covers it). The OS releases the
     # handle even if the process is killed mid-resume.
@@ -1039,7 +1073,7 @@ if ($Resume -or $Reconcile) {
   $MaxRounds      = [int]$st.maxRounds
   $BufferSeconds  = [int]$st.bufferSeconds
   $PollMinutes    = [int]$st.pollMinutes
-  $script:logFile = Join-Path $Project "claude-resume.log"
+  $script:logFile = Join-Path $Project "quotawake.log"
   $fireAt = Get-StateFireAt $st
 
   if ($Reconcile -and $fireAt -gt (Get-Date)) {
@@ -1053,13 +1087,13 @@ if ($Resume -or $Reconcile) {
   }
 
   Set-Location $Project
-  Log "=== claude-resume resuming in $Project (round $([int]$st.roundsUsed + 1)) ==="
+  Log "=== quotawake resuming in $Project (round $([int]$st.roundsUsed + 1)) ==="
   exit (Invoke-Round ([bool]$st.continue) ([int]$st.roundsUsed + 1))
 }
 
 # --- fresh start ---
 Set-Location $Project
-$script:logFile = Join-Path $Project "claude-resume.log"
+$script:logFile = Join-Path $Project "quotawake.log"
 
 if ($At) {
   $when = Parse-AtTime $At
@@ -1073,7 +1107,7 @@ if ($At) {
   exit 5
 }
 
-Log "=== claude-resume starting in $Project ==="
+Log "=== quotawake starting in $Project ==="
 if (-not $PermissionMode) {
   Log "WARNING: no -PermissionMode given — headless claude cannot approve its own actions, so file edits and most commands will be auto-denied. Pass -PermissionMode acceptEdits for unattended work."
 }

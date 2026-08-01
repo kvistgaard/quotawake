@@ -1,15 +1,15 @@
-# Unit tests for claude-resume.ps1 — dot-sources it in -SelfTest mode so no real
+# Unit tests for quotawake.ps1 — dot-sources it in -SelfTest mode so no real
 # `claude` runs, no scheduled task is registered, and no quota is spent.
-# Run:  pwsh -File .\claude-resume.Tests.ps1
+# Run:  pwsh -File .\quotawake.Tests.ps1
 $ErrorActionPreference = "Stop"
 
-$tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("claude-resume-test-" + [guid]::NewGuid().ToString("N").Substring(0,8))
+$tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("quotawake-test-" + [guid]::NewGuid().ToString("N").Substring(0,8))
 New-Item -ItemType Directory -Path $tmp -Force | Out-Null
 
 # Bring functions + $limitPattern into this scope; skip the entry points.
-. (Join-Path $PSScriptRoot "claude-resume.ps1") -SelfTest -Project $tmp
+. (Join-Path $PSScriptRoot "quotawake.ps1") -SelfTest -Project $tmp
 $script:StateFile = Join-Path $tmp "pending-resume.json"   # keep test state out of the real file
-$script:logFile   = Join-Path $tmp "claude-resume.log"
+$script:logFile   = Join-Path $tmp "quotawake.log"
 
 $script:pass = 0; $script:fail = 0
 function Check([string]$name, [bool]$cond) {
@@ -273,7 +273,7 @@ Check "a real rescue attempts a desktop toast"           ($script:toasts.Count -
 Check "the toast says not to re-run by hand"             ($script:toasts[0] -match 'do not re-run')
 # The whole point of --bg over -p: the rescue must be findable from the phone,
 # so the notice has to name the agent and say how to reach it.
-$n = Get-Content (Join-Path $tmp "CLAUDE-RESUMED.md") -Raw
+$n = Get-Content (Join-Path $tmp "QUOTAWAKE-RESUMED.md") -Raw
 Check "notice names the background agent"                ($n -match 'abcd1234')
 Check "notice says it is visible in the Claude app"      ($n -match '(?i)Claude app')
 Check "notice gives the attach/logs commands"            ($n -match 'claude attach abcd1234' -and $n -match 'claude logs abcd1234')

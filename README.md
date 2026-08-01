@@ -1,4 +1,4 @@
-# claude-resume
+# quotawake
 
 Auto-resumes **Claude Code** work across usage-limit resets. Claude Code has no
 event that fires on "usage limit reached" and no built-in resume when the window
@@ -6,7 +6,7 @@ reopens — this fills that gap, on Windows, with no resident process.
 
 Two independent things live here:
 
-- **The wrapper** — you launch a task through it (`crun`), and it re-runs that
+- **The wrapper** — you launch a task through it (`qw`), and it re-runs that
   task itself after each reset.
 - **Session rescue** — it watches *every* Claude Code session on the machine,
   including ordinary interactive ones you never launched through the wrapper,
@@ -29,7 +29,7 @@ That is what makes a resume survive the things that killed an in-process wait:
   machine is back; `WakeToRun` may wake it at the exact time (power policy
   permitting).
 - **Reboot, logoff, closed window** — the task and the state file persist.
-- **A reconciler** (`ClaudeResume-Logon`, created once by `-Install`) runs at logon
+- **A reconciler** (`QuotaWake-Logon`, created once by `-Install`) runs at logon
   **and every 15 minutes**, re-arming anything whose one-shot task went missing and
   exiting instantly when there is nothing to do. The 15-minute trigger is
   load-bearing, not cosmetic: on a Modern Standby machine the session almost never
@@ -55,7 +55,7 @@ back to what it was doing. An agent genuinely back at work runs tools; that also
 preserves the property that an open TUI's own auto-continue (~3 min after the
 reset) still wins over a rescue.
 
-**What it does.** It arms `ClaudeResume-FireSessions` for reset + 5 min, writes
+**What it does.** It arms `QuotaWake-FireSessions` for reset + 5 min, writes
 `pending-sessions.json` (which makes the keep-awake watcher hold the machine awake
 on AC), re-checks each session immediately before firing, then dispatches:
 
@@ -87,7 +87,7 @@ The rescue therefore reports itself three ways:
 | Where | What you get |
 |---|---|
 | **The Claude app, including mobile** | `--bg` registers a real background session (under a **new** id), so the rescue is listed, watchable and steerable from your phone. A `-p` run registers nothing and is invisible everywhere — which is why a working rescue used to be indistinguishable from a broken one. |
-| **`CLAUDE-RESUMED.md`** | Dropped in the rescued project's own folder: agent id, result, the run's final message, and the `attach` / `logs` commands. |
+| **`QUOTAWAKE-RESUMED.md`** | Dropped in the rescued project's own folder: agent id, result, the run's final message, and the `attach` / `logs` commands. |
 | **A desktop toast** | Fired on completion. Uses BurntToast if installed, otherwise a WinRT toast shelled out to Windows PowerShell 5.1 (pwsh 7 lacks that projection). |
 
 ```powershell
@@ -102,21 +102,21 @@ redoes finished work; it cost a duplicated pass on 2026-07-31.
 ## Setup (once)
 
 ```powershell
-.\claude-resume.ps1 -Install
+.\quotawake.ps1 -Install
 ```
 
 That binds the tool to wherever the script currently sits, and is the only step:
 
-- registers the `ClaudeResume-Logon` scheduled task (logon + every 15 min, hidden),
-- adds the folder to your **user PATH**, dropping any stale `claude-resume` entry,
-- writes the `crun` shortcut into `$PROFILE.CurrentUserAllHosts`,
+- registers the `QuotaWake-Logon` scheduled task (logon + every 15 min, hidden),
+- adds the folder to your **user PATH**, dropping any stale `quotawake` entry,
+- writes the `qw` shortcut into `$PROFILE.CurrentUserAllHosts`,
 - writes the keep-awake watcher's autostart stub into your Startup folder.
 
-Open a **new** shell afterwards for PATH and `crun` to take effect, and start the
+Open a **new** shell afterwards for PATH and `qw` to take effect, and start the
 watcher without waiting for a logon:
 
 ```powershell
-wscript "$([Environment]::GetFolderPath('Startup'))\keep-awake-claude.vbs"
+wscript "$([Environment]::GetFolderPath('Startup'))\quotawake-keepawake.vbs"
 ```
 
 `-Uninstall` reverses all four, plus the state files.
@@ -124,34 +124,34 @@ wscript "$([Environment]::GetFolderPath('Startup'))\keep-awake-claude.vbs"
 ### Moving the folder (or cloning it somewhere new)
 
 Four things bind to an absolute path: the scheduled task, the PATH entry, the
-`crun` shortcut, and the watcher's autostart stub. Moving the folder breaks every
+`qw` shortcut, and the watcher's autostart stub. Moving the folder breaks every
 one of them **silently** — no reconciler, no rescues, no watcher, and no error
 anywhere. Re-running `-Install` from the new location rewrites all four, so:
 
 ```powershell
 cd <new location>
-.\claude-resume.ps1 -Install
+.\quotawake.ps1 -Install
 ```
 
 Then end any watcher still running from the old path (`Get-Process pwsh` — it is
-the one whose command line points at the old `keep-awake-claude.ps1`) and start
+the one whose command line points at the old `keep-awake.ps1`) and start
 the new one with the `wscript` line above. State files do not need moving: their
 absence just means nothing is pending.
 
 ## Usage
 
-The script is on your **User PATH**, and a `crun` function in
+The script is on your **User PATH**, and a `qw` function in
 `$PROFILE.CurrentUserAllHosts` forwards every argument so you can drop the `.ps1`:
 
 ```powershell
 # Fire-and-forget; on a limit it arms the resume and exits:
-crun -Task "revise my note per the inline comments" -PermissionMode acceptEdits -Project "C:\path\to\workspace"
+qw -Task "revise my note per the inline comments" -PermissionMode acceptEdits -Project "C:\path\to\workspace"
 
 # Resume the most recent conversation in the current folder:
-crun -Continue
+qw -Continue
 
 # Arm a resume for a time you saw on screen, and exit:
-crun -Continue -At "3pm"
+qw -Continue -At "3pm"
 ```
 
 Session rescue needs none of this — it runs on its own once `-Install` is done.
@@ -179,18 +179,18 @@ notice anyway.
 
 | Piece | What it is |
 |---|---|
-| `claude-resume.ps1` | The wrapper — all logic. |
-| `keep-awake-claude.ps1` | Companion watcher: holds the system awake **on AC only** while a Claude CLI session is running or a resume is armed. Never touches static power settings; never blocks display sleep. |
+| `quotawake.ps1` | The wrapper — all logic. |
+| `keep-awake.ps1` | Companion watcher: holds the system awake **on AC only** while a Claude CLI session is running or a resume is armed. Never touches static power settings; never blocks display sleep. |
 | `run-hidden.vbs` | Launches the script hidden so tasks never flash a console. |
 | `pending-resume.json` | *Transient.* Exists only while a wrapper resume is pending. |
 | `pending-sessions.json` | *Transient.* Exists only while stranded sessions await their reset. Also read by the keep-awake watcher. |
 | `resumed-sessions.json` | Persistent ledger of handled `(sessionId, limit-time)` pairs, so no stop is resumed twice. Capped. |
 | `.session-rescue.lock` | Lock file preventing the 15-min pass and the one-shot task from double-resuming. Empty; safe to leave. |
-| `CLAUDE-RESUMED.md` | Written into the **rescued project's** folder, not here. Appended, so rescues stack in reading order. |
-| `ClaudeResume-Logon` | The permanent reconciler: logon + every 15 min, hidden, near-zero cost. |
-| `ClaudeResume-Fire` | One-shot task for a wrapper resume; exists only while one is pending. |
-| `ClaudeResume-FireSessions` | One-shot task for session rescue at reset + 5 min. |
-| `claude-resume.log` | Every decision the rescue makes, with reasons. First place to look. |
+| `QUOTAWAKE-RESUMED.md` | Written into the **rescued project's** folder, not here. Appended, so rescues stack in reading order. |
+| `QuotaWake-Logon` | The permanent reconciler: logon + every 15 min, hidden, near-zero cost. |
+| `QuotaWake-Fire` | One-shot task for a wrapper resume; exists only while one is pending. |
+| `QuotaWake-FireSessions` | One-shot task for session rescue at reset + 5 min. |
+| `quotawake.log` | Every decision the rescue makes, with reasons. First place to look. |
 
 ## Limitations
 
@@ -217,7 +217,7 @@ otherwise Claude's own non-zero exit code.
 ## Tests
 
 ```powershell
-pwsh -File claude-resume.Tests.ps1
+pwsh -File quotawake.Tests.ps1
 ```
 
 79 assertions against a mocked `claude` and mocked task registration — no real

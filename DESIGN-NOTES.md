@@ -102,7 +102,7 @@ already finished it, duplicating the work.
 
 `claude --resume <id> --bg …` returns immediately, registers a real background
 session under a **new** id, and is visible and steerable from the app. Rescues also
-write `CLAUDE-RESUMED.md` into the rescued project and raise a desktop toast, so
+write `QUOTAWAKE-RESUMED.md` into the rescued project and raise a desktop toast, so
 there are three independent signals rather than none.
 
 Consequences worth knowing:
@@ -132,7 +132,7 @@ Consequences worth knowing:
 
 ## The keep-awake watcher
 
-A rescue is useless if the machine sleeps through the reset. `keep-awake-claude.ps1`
+A rescue is useless if the machine sleeps through the reset. `keep-awake.ps1`
 holds `ES_SYSTEM_REQUIRED` only when on AC **and** either a Claude Code CLI process
 is running or a resume is armed. It deliberately:
 
