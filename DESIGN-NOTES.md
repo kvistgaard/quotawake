@@ -113,6 +113,49 @@ Consequences worth knowing:
 - `claude logs <id>` replays raw TUI output, escape codes and all. It is for
   humans, not parsing — read the transcript instead.
 
+## Cross-platform, and how it was tested without the platforms
+
+The tool was Windows-only for its whole life. Porting it raised an awkward
+problem: the macOS backend cannot be exercised from a Windows machine, and this
+project's entire history is of code that looked correct and silently did
+nothing. Shipping unverifiable code was the exact failure mode to avoid.
+
+Three things followed from that.
+
+**One narrow contract.** Everything OS-specific reduces to: register a job,
+remove it, ask whether it exists. Three backends implement it — Task Scheduler,
+launchd, `systemd --user`. Each must guarantee (1) a job whose moment passed
+while the machine was asleep or off still runs once it is back, and (2) the
+registration survives reboot. Waking a sleeping machine is explicitly not
+required, because it needs wake timers on Windows and root elsewhere; a rescue
+is delayed to the next wake, never lost.
+
+**The OS-specific parts are pure generators.** `New-LaunchdPlist` and
+`New-SystemdUnits` return text and touch nothing. That moves the part most
+likely to be wrong — the exact plist and unit content — into unit tests that run
+anywhere, leaving only the thin `launchctl` / `systemctl` invocations unproven.
+The generated systemd units are then fed to a real `systemd-analyze verify`,
+which accepted all three with no complaints and normalised the `OnCalendar`
+value to the intended instant. That is a genuine external check, not a
+self-assessment.
+
+**`-Doctor` covers the rest.** It runs on the target machine and proves the
+integration there, including registering a real one-shot job, confirming the
+scheduler can see it, and removing it again. It exists because the alternative
+was asking someone to trust untested code — and on this project, that trust has
+never once been repaid.
+
+Honest status: Windows fully exercised; Linux unit generation externally
+validated; **macOS unverified**, written to launchd's documented behaviour with
+its plist generation unit-tested but never run on a Mac.
+
+Two platform details worth knowing. On Linux, user timers die at logout unless
+`loginctl enable-linger` is set — without it the tool silently stops existing
+the moment you close an SSH session; `-Install` tries, but it usually needs
+polkit or root. On macOS, a one-shot uses `StartCalendarInterval`, which
+nominally recurs yearly; that is harmless here because the job's own run clears
+the state and unregisters the plist.
+
 ## Platform gotchas that cost real debugging time
 
 - **`claude --resume <id>` only finds sessions belonging to the current

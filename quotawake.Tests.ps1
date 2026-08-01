@@ -291,6 +291,55 @@ Check "unreachable project folder -> not resumed"        ($script:resumed.Count 
 Check "unreachable project folder -> NOT written off"    (-not (Test-ProcessedSession (Get-ProcessedSessions) "gggg-8888" (ConvertTo-IsoUtcString $past)))
 Check "unreachable project folder -> retry re-armed"     ($script:sessArmed.Count -eq 1)
 
+Write-Host "== platform layer =="
+# The launchd and systemd backends cannot run on a Windows box, so everything
+# OS-specific is written as a PURE GENERATOR returning text. That makes the part
+# most likely to be wrong — the exact plist and unit content — testable
+# everywhere, and leaves only the `launchctl`/`systemctl` calls unverified.
+# -Doctor covers those on the machine they actually run on.
+$realPlatform = $script:Platform
+Check "platform detected"                 ($realPlatform -eq 'Windows')
+Check "job slug strips prefix and case"   ((Get-JobSlug 'QuotaWake-FireSessions') -eq 'firesessions')
+Check "job slug stable for Fire"          ((Get-JobSlug 'QuotaWake-Fire') -eq 'fire')
+
+$fire = [datetime]'2026-08-01 15:05:00'
+
+$script:Platform = 'macOS'
+$argv = Get-SelfArgv '-Reconcile'
+Check "unix argv invokes pwsh -File"      ($argv[0] -match 'pwsh' -and ($argv -contains '-File') -and ($argv -contains '-Reconcile'))
+$plist = New-LaunchdPlist 'QuotaWake-FireSessions' '-Reconcile' $fire 0
+$xmlOk = $false; try { [void][xml]$plist; $xmlOk = $true } catch {}
+Check "launchd plist is well-formed XML"  $xmlOk
+Check "launchd label namespaced"          ($plist -match '<string>com\.quotawake\.firesessions</string>')
+Check "launchd invokes the script"        ($plist -match 'quotawake\.ps1' -and $plist -match '\-Reconcile')
+Check "launchd one-shot: exact moment"    ($plist -match '<key>Month</key><integer>8</integer>' -and
+                                           $plist -match '<key>Day</key><integer>1</integer>' -and
+                                           $plist -match '<key>Hour</key><integer>15</integer>' -and
+                                           $plist -match '<key>Minute</key><integer>5</integer>')
+Check "launchd one-shot never RunAtLoad"  ($plist -match '<key>RunAtLoad</key><false/>')
+$rec = New-LaunchdPlist 'QuotaWake-Logon' '-Reconcile' $null 15
+Check "launchd recurring: StartInterval"  ($rec -match '<key>StartInterval</key><integer>900</integer>')
+Check "launchd recurring: RunAtLoad"      ($rec -match '<key>RunAtLoad</key><true/>')
+
+$script:Platform = 'Linux'
+$u = New-SystemdUnits 'QuotaWake-FireSessions' '-Reconcile' $fire 0
+Check "systemd service is oneshot"        ($u.Service -match '(?m)^Type=oneshot$')
+Check "systemd ExecStart runs the script" ($u.Service -match 'quotawake\.ps1' -and $u.Service -match '\-Reconcile')
+Check "systemd timer: exact moment"       ($u.Timer -match '(?m)^OnCalendar=2026-08-01 15:05:00$')
+# Persistent=true is the systemd spelling of StartWhenAvailable. Without it a
+# timer whose moment passed while the machine was off never runs at all, which
+# is the whole guarantee this tool rests on.
+Check "systemd timer is Persistent"       ($u.Timer -match '(?m)^Persistent=true$')
+Check "systemd timer installs correctly"  ($u.Timer -match '(?m)^WantedBy=timers\.target$')
+$ur = New-SystemdUnits 'QuotaWake-Logon' '-Reconcile' $null 15
+Check "systemd recurring: 15min interval" ($ur.Timer -match '(?m)^OnUnitActiveSec=15min$')
+Check "systemd recurring: fires at boot"  ($ur.Timer -match '(?m)^OnBootSec=')
+Check "watcher unit restarts on failure"  ((New-WatcherSystemdUnit) -match '(?m)^Restart=always$')
+Check "watcher agent keeps alive"         ((New-WatcherLaunchAgent) -match '<key>KeepAlive</key><true/>')
+
+$script:Platform = $realPlatform
+Check "platform restored"                 ($script:Platform -eq 'Windows')
+
 Write-Host ""
 $col = if ($script:fail -eq 0) { "Green" } else { "Red" }
 Write-Host ("RESULT: {0} passed, {1} failed" -f $script:pass, $script:fail) -ForegroundColor $col

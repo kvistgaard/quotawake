@@ -35,6 +35,14 @@ fire on its own.
 
 ## House rules
 
+- **OS-specific code must be a pure generator plus a thin call.** Return the
+  plist/unit/command as text from a function that touches nothing, then execute
+  it separately. That is what makes the macOS and Linux backends testable from a
+  machine that is neither. Never inline OS-specific text into the code that runs
+  it.
+- **Anything you cannot test here must be checkable by `-Doctor`.** If you add a
+  platform capability, add the corresponding check. macOS in particular has
+  never been run.
 - No absolute paths. Use `$PSScriptRoot`; a hardcoded path once disabled the
   keep-awake watcher entirely.
 - Timestamps from `ConvertFrom-Json` are `Kind=Utc` and print as UTC. Normalise
