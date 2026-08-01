@@ -14,7 +14,7 @@ resumed-sessions.json
 *.log
 
 # Written into a rescued project's folder; if one ever lands here, it is noise.
-CLAUDE-RESUMED.md
+QUOTAWAKE-RESUMED.md
 
 # Claude Code per-machine settings: absolute paths and a personal allowlist.
 .claude/settings.local.json

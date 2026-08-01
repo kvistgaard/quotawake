@@ -1,8 +1,8 @@
 # Keeps Windows system awake (display may still sleep) only when BOTH:
 #   - the laptop is on AC power, AND
 #   - a Claude Code CLI session is running (node_modules\@anthropic-ai\claude-code\bin\claude.exe)
-#     OR claude-resume.ps1 has a resume armed (pending-resume.json for a
-#     crun-launched task, pending-sessions.json for stranded interactive
+#     OR quotawake.ps1 has a resume armed (pending-resume.json for a
+#     qw-launched task, pending-sessions.json for stranded interactive
 #     sessions) — it exits between a limit hit and the reset by design, so
 #     there is no claude.exe process during that wait; without this, wake
 #     timers are the only thing that could resume it, and those are
@@ -10,7 +10,7 @@
 # Otherwise releases the lock so normal power-saving (incl. battery sleep timers) applies.
 # Verify with: powercfg /requests   (look for a SYSTEM request from this script's pwsh PID)
 
-# Beside this script, wherever it lives — claude-resume.ps1 writes them there too.
+# Beside this script, wherever it lives — quotawake.ps1 writes them there too.
 # These were absolute paths once, which silently broke the watcher's whole reason
 # for existing if the folder was ever moved or copied to another machine: both
 # Test-Path checks would just return false and the awake-lock would never be held
@@ -34,7 +34,7 @@ public static class PowerHelper {
 $ES_CONTINUOUS      = [uint32]2147483648
 $ES_SYSTEM_REQUIRED = [uint32]1
 
-$logPath     = Join-Path $PSScriptRoot 'keep-awake-claude.log'
+$logPath     = Join-Path $PSScriptRoot 'keep-awake.log'
 $pollSeconds = 30
 $held        = $false
 

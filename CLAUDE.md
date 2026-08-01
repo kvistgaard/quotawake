@@ -1,4 +1,4 @@
-# Working on claude-resume
+# Working on quotawake
 
 Read `DESIGN-NOTES.md` before changing behaviour. Nearly every decision here was
 made in response to a specific silent failure, and the obvious simplification is
@@ -23,7 +23,7 @@ Concretely:
 
 ## Verifying
 
-`pwsh -File claude-resume.Tests.ps1` — all assertions must pass. They mock
+`pwsh -File quotawake.Tests.ps1` — all assertions must pass. They mock
 `claude` and task registration, so they spend no quota and register nothing.
 
 Unit tests are necessary but have twice been insufficient here: they passed while
