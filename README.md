@@ -102,10 +102,41 @@ redoes finished work; it cost a duplicated pass on 2026-07-31.
 ## Setup (once)
 
 ```powershell
-claude-resume.ps1 -Install     # registers the ClaudeResume-Logon task
+.\claude-resume.ps1 -Install
 ```
 
-`-Uninstall` removes the logon task, any armed one-shot task, and the state files.
+That binds the tool to wherever the script currently sits, and is the only step:
+
+- registers the `ClaudeResume-Logon` scheduled task (logon + every 15 min, hidden),
+- adds the folder to your **user PATH**, dropping any stale `claude-resume` entry,
+- writes the `crun` shortcut into `$PROFILE.CurrentUserAllHosts`,
+- writes the keep-awake watcher's autostart stub into your Startup folder.
+
+Open a **new** shell afterwards for PATH and `crun` to take effect, and start the
+watcher without waiting for a logon:
+
+```powershell
+wscript "$([Environment]::GetFolderPath('Startup'))\keep-awake-claude.vbs"
+```
+
+`-Uninstall` reverses all four, plus the state files.
+
+### Moving the folder (or cloning it somewhere new)
+
+Four things bind to an absolute path: the scheduled task, the PATH entry, the
+`crun` shortcut, and the watcher's autostart stub. Moving the folder breaks every
+one of them **silently** — no reconciler, no rescues, no watcher, and no error
+anywhere. Re-running `-Install` from the new location rewrites all four, so:
+
+```powershell
+cd <new location>
+.\claude-resume.ps1 -Install
+```
+
+Then end any watcher still running from the old path (`Get-Process pwsh` — it is
+the one whose command line points at the old `keep-awake-claude.ps1`) and start
+the new one with the `wscript` line above. State files do not need moving: their
+absence just means nothing is pending.
 
 ## Usage
 
