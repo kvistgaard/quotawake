@@ -1,0 +1,28 @@
+# Transient state. These exist ONLY while something is waiting for a reset and
+# are deleted the moment it completes — their absence is the healthy state.
+pending-resume.json
+pending-sessions.json
+.session-rescue.lock
+
+# Ledger of handled (sessionId, limit-time) pairs. Machine-local, and session
+# ids are not worth publishing.
+resumed-sessions.json
+
+# Logs. These matter most: the wrapper appends Claude's own stdout, so the log
+# accumulates whatever you were actually working on — drafts, file contents,
+# private project material. Never commit one.
+*.log
+
+# Written into a rescued project's folder; if one ever lands here, it is noise.
+CLAUDE-RESUMED.md
+
+# Claude Code per-machine settings: absolute paths and a personal allowlist.
+.claude/settings.local.json
+
+# Scratch folders from live end-to-end tests.
+.livetest*/
+
+# The original internal handoff note. Its content lives on, scrubbed, in
+# DESIGN-NOTES.md; this copy is kept locally only because it also records
+# machine specifics and home paths that should not be published. Safe to delete.
+remote-control-keepawake-handoff.md
