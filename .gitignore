@@ -16,8 +16,13 @@ resumed-sessions.json
 # Written into a rescued project's folder; if one ever lands here, it is noise.
 QUOTAWAKE-RESUMED.md
 
-# Claude Code per-machine settings: absolute paths and a personal allowlist.
-.claude/settings.local.json
+# Claude Code's per-project folder, entirely. It currently holds only
+# settings.local.json — absolute paths and a personal permission allowlist, which
+# is machine-specific and not useful to anyone else. Nothing in here is shared
+# configuration, so the whole directory stays local. (If a genuinely shareable
+# .claude/settings.json or a project skill is ever added, un-ignore just that
+# file rather than the directory.)
+.claude/
 
 # Scratch folders from live end-to-end tests.
 .livetest*/
