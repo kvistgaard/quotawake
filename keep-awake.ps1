@@ -15,19 +15,20 @@
 #
 # Verify a live hold:
 #   Windows  powercfg /requests          (a SYSTEM request from this pwsh PID)
-#   macOS    pmset -g assertions         (PreventSystemSleep from caffeinate)
 #   Linux    systemd-inhibit --list      (a sleep block from quotawake)
+#
+# Windows and Linux only; on anything else the watcher idles without holding.
 
 $pendingResumeFile   = Join-Path $PSScriptRoot 'pending-resume.json'
 $pendingSessionsFile = Join-Path $PSScriptRoot 'pending-sessions.json'
 $logPath             = Join-Path $PSScriptRoot 'keep-awake.log'
 $pollSeconds         = 30
 $held                = $false
-$holdProcess         = $null      # macOS/Linux: the child that owns the hold
+$holdProcess         = $null      # Linux: the child that owns the hold
 
 $platform = if ($PSVersionTable.PSVersion.Major -lt 6) { 'Windows' }
-            elseif ($IsWindows) { 'Windows' } elseif ($IsMacOS) { 'macOS' }
-            elseif ($IsLinux) { 'Linux' } else { 'Unknown' }
+            elseif ($IsWindows) { 'Windows' }
+            elseif ($IsLinux) { 'Linux' } else { 'Unsupported' }
 
 if ($platform -eq 'Windows') {
   Add-Type -AssemblyName System.Windows.Forms
@@ -53,10 +54,6 @@ function Write-Log($msg) {
 function Test-OnAcPower {
   switch ($platform) {
     'Windows' { return ([System.Windows.Forms.SystemInformation]::PowerStatus.PowerLineStatus -eq 'Online') }
-    'macOS' {
-      # `pmset -g batt` prints "Now drawing from 'AC Power'" or "'Battery Power'".
-      try { return ((& pmset -g batt 2>$null | Out-String) -match "'AC Power'") } catch { return $true }
-    }
     'Linux' {
       # Mains supplies expose online=1. A desktop or VM has no battery at all,
       # in which case treat it as permanently on AC rather than never holding.
@@ -77,7 +74,7 @@ function Test-OnAcPower {
 function Test-ClaudeSessionRunning {
   # Match on the CLI's own module path so the Claude desktop app, which can sit
   # open for days, never counts as an active coding session. Both separators are
-  # accepted so the same check works on every platform.
+  # accepted so the same check works on either platform.
   foreach ($p in (Get-Process -Name claude -ErrorAction SilentlyContinue)) {
     try {
       if ($p.Path -and ($p.Path -like '*node_modules*@anthropic-ai*claude-code*')) { return $true }
@@ -89,11 +86,6 @@ function Test-ClaudeSessionRunning {
 function Start-AwakeHold {
   switch ($platform) {
     'Windows' { [PowerHelper]::SetThreadExecutionState($ES_CONTINUOUS -bor $ES_SYSTEM_REQUIRED) | Out-Null; return $null }
-    'macOS' {
-      # -s prevents system sleep only while on AC, which is exactly the policy
-      # here; the display is left alone deliberately.
-      return (Start-Process caffeinate -ArgumentList '-s' -PassThru -WindowStyle Hidden)
-    }
     'Linux' {
       # The inhibit lasts as long as this child lives, so releasing is a kill.
       return (Start-Process systemd-inhibit -PassThru -WindowStyle Hidden -ArgumentList @(
@@ -110,7 +102,7 @@ function Stop-AwakeHold($proc) {
 }
 
 Write-Log "watcher started (PID $PID, platform $platform)"
-if ($platform -eq 'Unknown') { Write-Log "unknown platform - holds are disabled, watcher will idle" }
+if ($platform -eq 'Unsupported') { Write-Log "unsupported platform - holds are disabled, watcher will idle" }
 
 while ($true) {
   $onAC           = Test-OnAcPower

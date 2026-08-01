@@ -224,6 +224,11 @@ function Invoke-SessionResume($hit) {
 }
 $script:toasts = @()
 function Show-RescueToast([string]$title, [string]$body) { $script:toasts += $body; return $false }
+# Nothing here may shell out to the real `claude agents`: it would be slow, and
+# it would make the suite's verdict depend on whatever the machine happens to be
+# running. Individual cases below override this to describe a live session.
+$script:agents = @()
+function Get-AgentList { return $script:agents }
 
 function NewLimitLine([string]$sid, [datetime]$ts, [string]$resetText, [string]$cwd) {
   ([ordered]@{
@@ -291,12 +296,50 @@ Check "unreachable project folder -> not resumed"        ($script:resumed.Count 
 Check "unreachable project folder -> NOT written off"    (-not (Test-ProcessedSession (Get-ProcessedSessions) "gggg-8888" (ConvertTo-IsoUtcString $past)))
 Check "unreachable project folder -> retry re-armed"     ($script:sessArmed.Count -eq 1)
 
+# A stop line records that a session HIT a limit. It does not record that the
+# session is gone — and a session that is still running must never be resumed,
+# because `--resume --bg` forks it rather than continuing it. Missing this turned
+# one live interactive window into a three-deep chain of background agents in
+# half an hour on 2026-08-01: the tool rescued the user's own terminal, then
+# rescued its own rescue, twice.
+function ScanOnly([string]$sid, $agents) {
+  $script:agents = $agents
+  WriteStop $past $past.AddMinutes(30) $sid $tmp
+  Remove-Item $script:ProcessedSessionsFile, $script:SessionsStateFile -Force -ErrorAction SilentlyContinue
+  $script:resumed = @(); $script:sessArmed = @()
+  Invoke-SessionReconcile
+  Remove-Item (Join-Path $tmp $SessionNoticeFile) -Force -ErrorAction SilentlyContinue
+}
+
+# The user's own open window. Its TUI continues by itself after a reset.
+ScanOnly "live-0001" @([pscustomobject]@{ sessionId = "live-0001"; pid = 4242; kind = "interactive"; status = "idle" })
+Check "a live interactive session is never rescued"      ($script:resumed.Count -eq 0)
+Check "a live session is NOT written off as handled"     (-not (Test-ProcessedSession (Get-ProcessedSessions) "live-0001" (ConvertTo-IsoUtcString $past)))
+
+# An agent waiting on a permission prompt needs a human, not a second copy.
+ScanOnly "blkd-0002" @([pscustomobject]@{ sessionId = "blkd-0002"; id = "blkd"; kind = "background"; state = "blocked"; status = "waiting" })
+Check "an agent blocked on a prompt is left alone"       ($script:resumed.Count -eq 0)
+
+# A previously dispatched rescue, still running: resuming it is what chained.
+ScanOnly "bgrn-0003" @([pscustomobject]@{ sessionId = "bgrn-0003"; id = "bgrn"; kind = "background"; state = "running" })
+Check "a running background agent is not re-rescued"     ($script:resumed.Count -eq 0)
+
+# But a finished agent holds no process, so it stays eligible.
+ScanOnly "done-0004" @([pscustomobject]@{ sessionId = "done-0004"; id = "done"; kind = "background"; state = "done" })
+Check "a finished agent is still a valid target"         ($script:resumed -contains "done-0004")
+
+# Losing the agent list must not disable rescue altogether.
+ScanOnly "gone-0005" @()
+Check "an unreadable agent list still allows rescue"     ($script:resumed -contains "gone-0005")
+$script:agents = @()
+
 Write-Host "== platform layer =="
-# The launchd and systemd backends cannot run on a Windows box, so everything
-# OS-specific is written as a PURE GENERATOR returning text. That makes the part
-# most likely to be wrong — the exact plist and unit content — testable
-# everywhere, and leaves only the `launchctl`/`systemctl` calls unverified.
-# -Doctor covers those on the machine they actually run on.
+# The systemd backend cannot run on a Windows box, so everything OS-specific is
+# written as a PURE GENERATOR returning text. That makes the part most likely to
+# be wrong — the exact unit content — testable everywhere, and leaves only the
+# `systemctl` calls unverified. -Doctor covers those where they actually run.
+# (A launchd backend existed until ac11ea2 and was removed for lack of a Mac to
+# test on; macOS is now refused by name rather than half-supported.)
 $realPlatform = $script:Platform
 Check "platform detected"                 ($realPlatform -eq 'Windows')
 Check "job slug strips prefix and case"   ((Get-JobSlug 'QuotaWake-FireSessions') -eq 'firesessions')
@@ -304,24 +347,22 @@ Check "job slug stable for Fire"          ((Get-JobSlug 'QuotaWake-Fire') -eq 'f
 
 $fire = [datetime]'2026-08-01 15:05:00'
 
+# An unsupported OS must fail loudly. Every backend switch below would otherwise
+# match no branch and do nothing, so -Install would report success having
+# registered no job at all — the exact silent-success failure mode this tool has
+# already shipped four times.
 $script:Platform = 'macOS'
-$argv = Get-SelfArgv '-Reconcile'
-Check "unix argv invokes pwsh -File"      ($argv[0] -match 'pwsh' -and ($argv -contains '-File') -and ($argv -contains '-Reconcile'))
-$plist = New-LaunchdPlist 'QuotaWake-FireSessions' '-Reconcile' $fire 0
-$xmlOk = $false; try { [void][xml]$plist; $xmlOk = $true } catch {}
-Check "launchd plist is well-formed XML"  $xmlOk
-Check "launchd label namespaced"          ($plist -match '<string>com\.quotawake\.firesessions</string>')
-Check "launchd invokes the script"        ($plist -match 'quotawake\.ps1' -and $plist -match '\-Reconcile')
-Check "launchd one-shot: exact moment"    ($plist -match '<key>Month</key><integer>8</integer>' -and
-                                           $plist -match '<key>Day</key><integer>1</integer>' -and
-                                           $plist -match '<key>Hour</key><integer>15</integer>' -and
-                                           $plist -match '<key>Minute</key><integer>5</integer>')
-Check "launchd one-shot never RunAtLoad"  ($plist -match '<key>RunAtLoad</key><false/>')
-$rec = New-LaunchdPlist 'QuotaWake-Logon' '-Reconcile' $null 15
-Check "launchd recurring: StartInterval"  ($rec -match '<key>StartInterval</key><integer>900</integer>')
-Check "launchd recurring: RunAtLoad"      ($rec -match '<key>RunAtLoad</key><true/>')
+$threw = $false
+try { Assert-SupportedPlatform } catch { $threw = $true; $msg = $_.Exception.Message }
+Check "macOS is refused, not half-supported" $threw
+Check "the refusal names the platform"       ($msg -match 'macOS')
+$script:Platform = 'Unknown'
+$threw = $false; try { Assert-SupportedPlatform } catch { $threw = $true }
+Check "an unknown platform is refused too"   $threw
 
 $script:Platform = 'Linux'
+$argv = Get-SelfArgv '-Reconcile'
+Check "unix argv invokes pwsh -File"      ($argv[0] -match 'pwsh' -and ($argv -contains '-File') -and ($argv -contains '-Reconcile'))
 $u = New-SystemdUnits 'QuotaWake-FireSessions' '-Reconcile' $fire 0
 Check "systemd service is oneshot"        ($u.Service -match '(?m)^Type=oneshot$')
 Check "systemd ExecStart runs the script" ($u.Service -match 'quotawake\.ps1' -and $u.Service -match '\-Reconcile')
@@ -335,7 +376,7 @@ $ur = New-SystemdUnits 'QuotaWake-Logon' '-Reconcile' $null 15
 Check "systemd recurring: 15min interval" ($ur.Timer -match '(?m)^OnUnitActiveSec=15min$')
 Check "systemd recurring: fires at boot"  ($ur.Timer -match '(?m)^OnBootSec=')
 Check "watcher unit restarts on failure"  ((New-WatcherSystemdUnit) -match '(?m)^Restart=always$')
-Check "watcher agent keeps alive"         ((New-WatcherLaunchAgent) -match '<key>KeepAlive</key><true/>')
+Check "watcher unit runs keep-awake"      ((New-WatcherSystemdUnit) -match 'keep-awake\.ps1')
 
 $script:Platform = $realPlatform
 Check "platform restored"                 ($script:Platform -eq 'Windows')
