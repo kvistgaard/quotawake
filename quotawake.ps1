@@ -103,9 +103,9 @@ param(
   [switch]$Uninstall,
 
   # Check that this machine's platform integration actually works, and exit.
-  # This exists because the macOS and Linux backends cannot be exercised from a
-  # Windows development box: rather than asking anyone to trust untested code,
-  # -Doctor proves or disproves each piece where it actually runs.
+  # This exists because the Linux backend cannot be exercised from a Windows
+  # development box: rather than asking anyone to trust untested code, -Doctor
+  # proves or disproves each piece where it actually runs.
   [switch]$Doctor,
 
   # Define the functions and return without running — for the test harness.
@@ -276,32 +276,50 @@ function Clear-PendingState {
 # A backend must provide two guarantees, both load-bearing:
 #   1. a job whose moment passed while the machine was asleep or off still runs
 #      once the machine is back  (Windows StartWhenAvailable / systemd
-#      Persistent=true / launchd's own catch-up when it wakes);
+#      Persistent=true);
 #   2. the registration survives reboot and logoff.
 # Waking a *sleeping* machine is explicitly NOT required: on Windows it needs
-# wake timers (AC-only on typical laptop policy) and on macOS/Linux it needs
-# root. So a rescue is delayed to the next wake, never lost — the same
-# behaviour Windows already has on battery.
+# wake timers (AC-only on typical laptop policy) and on Linux it needs root. So
+# a rescue is delayed to the next wake, never lost — the same behaviour Windows
+# already has on battery.
+#
+# Supported: Windows and Linux. A launchd backend for macOS was written and then
+# removed at ac11ea2 because there was no Mac to test it on, and an untested
+# backend that silently registers nothing is worse than none at all — this tool
+# has already been broken four times by failures that looked like successes.
+# `git show ac11ea2 -- quotawake.ps1` has it if a Mac ever becomes available.
 
 function Get-Platform {
   if ($PSVersionTable.PSVersion.Major -lt 6) { return 'Windows' }  # 5.1 has no $IsWindows
   if ($IsWindows) { return 'Windows' }
-  if ($IsMacOS)   { return 'macOS' }
+  if ($IsMacOS)   { return 'macOS' }   # detected only so it can be refused by name
   if ($IsLinux)   { return 'Linux' }
   return 'Unknown'
 }
 $script:Platform = Get-Platform
 
+function Assert-SupportedPlatform {
+  # Every backend below switches on $script:Platform, and a switch with no
+  # matching branch does nothing at all — quietly. On an unsupported OS that
+  # would mean -Install reporting success while registering no job whatsoever.
+  # Fail loudly instead, at the one place all entry points pass through.
+  if ($script:Platform -in @('Windows', 'Linux')) { return }
+  $extra = if ($script:Platform -eq 'macOS') {
+    "The launchd backend was removed at ac11ea2 because it could not be tested."
+  } else { "" }
+  throw ("quotawake supports Windows and Linux; this is '{0}'. {1}" -f $script:Platform, $extra).Trim()
+}
+
 function Get-JobSlug([string]$name) {
-  # 'QuotaWake-FireSessions' -> 'firesessions'; used for launchd labels and
-  # systemd unit names, which are lowercase-by-convention and must be stable.
+  # 'QuotaWake-FireSessions' -> 'firesessions'; used for systemd unit names,
+  # which are lowercase-by-convention and must be stable.
   return (($name -replace '^QuotaWake-', '') -replace '[^A-Za-z0-9]', '').ToLowerInvariant()
 }
 
 function Get-SelfArgv([string]$arguments) {
   # argv that re-runs this script with $arguments, without a console window.
   # Windows keeps the .vbs shim (Task Scheduler would otherwise flash a
-  # console); launchd and systemd already run detached, so they call pwsh.
+  # console); systemd already runs detached, so it calls pwsh.
   if ($script:Platform -eq 'Windows') {
     return @('wscript.exe', ('"{0}" {1}' -f $HiddenLauncher, $arguments))
   }
@@ -310,54 +328,6 @@ function Get-SelfArgv([string]$arguments) {
   $argv = @($pwsh, '-NoProfile', '-NonInteractive', '-File', (Join-Path $ScriptDir 'quotawake.ps1'))
   foreach ($a in ($arguments -split '\s+' | Where-Object { $_ })) { $argv += $a }
   return $argv
-}
-
-# --- macOS: launchd ---
-function Get-LaunchdLabel([string]$name) { 'com.quotawake.' + (Get-JobSlug $name) }
-function Get-LaunchdPlistPath([string]$name) {
-  Join-Path (Join-Path $HOME 'Library/LaunchAgents') ((Get-LaunchdLabel $name) + '.plist')
-}
-function New-LaunchdPlist([string]$name, [string]$arguments, $fireAt, [int]$intervalMinutes) {
-  # Kept as a pure string builder so it can be unit-tested off a Mac.
-  # A one-shot uses StartCalendarInterval, which launchd re-runs on wake if the
-  # moment passed while asleep. It nominally recurs yearly, which is harmless
-  # here: the job's own run clears the state and unregisters the plist.
-  $argXml = ($(Get-SelfArgv $arguments) | ForEach-Object {
-    '    <string>{0}</string>' -f [System.Security.SecurityElement]::Escape($_)
-  }) -join "`n"
-  $schedule = if ($null -ne $fireAt) {
-    @"
-  <key>StartCalendarInterval</key>
-  <dict>
-    <key>Month</key><integer>$($fireAt.Month)</integer>
-    <key>Day</key><integer>$($fireAt.Day)</integer>
-    <key>Hour</key><integer>$($fireAt.Hour)</integer>
-    <key>Minute</key><integer>$($fireAt.Minute)</integer>
-  </dict>
-  <key>RunAtLoad</key><false/>
-"@
-  } else {
-    @"
-  <key>StartInterval</key><integer>$($intervalMinutes * 60)</integer>
-  <key>RunAtLoad</key><true/>
-"@
-  }
-  return @"
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>$(Get-LaunchdLabel $name)</string>
-  <key>ProgramArguments</key>
-  <array>
-$argXml
-  </array>
-$schedule
-  <key>WorkingDirectory</key><string>$([System.Security.SecurityElement]::Escape($ScriptDir))</string>
-  <key>ProcessType</key><string>Background</string>
-</dict>
-</plist>
-"@
 }
 
 # --- Linux: systemd --user ---
@@ -435,19 +405,6 @@ function Register-ScheduledJob {
           -Settings $settings -Force | Out-Null
       }
     }
-    'macOS' {
-      $plist = Get-LaunchdPlistPath $Name
-      New-Item -ItemType Directory -Force -Path (Split-Path -Parent $plist) | Out-Null
-      $body = if ($once) { New-LaunchdPlist $Name $Arguments $FireAt 0 }
-              else       { New-LaunchdPlist $Name $Arguments $null $IntervalMinutes }
-      Set-Content -LiteralPath $plist -Value $body -Encoding UTF8
-      $label = Get-LaunchdLabel $Name
-      # bootout first so a re-arm replaces rather than stacks; both calls are
-      # best-effort because bootout fails loudly when nothing is loaded.
-      & launchctl bootout "gui/$(id -u)/$label" 2>$null | Out-Null
-      & launchctl bootstrap "gui/$(id -u)" $plist 2>$null | Out-Null
-      if ($LASTEXITCODE -ne 0) { & launchctl load -w $plist 2>$null | Out-Null }  # pre-10.11 spelling
-    }
     'Linux' {
       $dir = Get-SystemdUnitDir
       New-Item -ItemType Directory -Force -Path $dir | Out-Null
@@ -465,10 +422,6 @@ function Register-ScheduledJob {
 function Unregister-ScheduledJob([string]$Name) {
   switch ($script:Platform) {
     'Windows' { Unregister-ScheduledTask -TaskName $Name -Confirm:$false -ErrorAction SilentlyContinue }
-    'macOS' {
-      & launchctl bootout "gui/$(id -u)/$(Get-LaunchdLabel $Name)" 2>$null | Out-Null
-      Remove-Item -LiteralPath (Get-LaunchdPlistPath $Name) -Force -ErrorAction SilentlyContinue
-    }
     'Linux' {
       $unit = Get-SystemdUnitName $Name
       [void](Invoke-Systemctl @('disable', '--now', "$unit.timer"))
@@ -482,7 +435,6 @@ function Unregister-ScheduledJob([string]$Name) {
 function Test-ScheduledJob([string]$Name) {
   switch ($script:Platform) {
     'Windows' { return [bool](Get-ScheduledTask -TaskName $Name -ErrorAction SilentlyContinue) }
-    'macOS'   { return (Test-Path -LiteralPath (Get-LaunchdPlistPath $Name)) }
     'Linux'   { return (Test-Path -LiteralPath (Join-Path (Get-SystemdUnitDir) ((Get-SystemdUnitName $Name) + '.timer'))) }
   }
   return $false
@@ -675,6 +627,48 @@ function Clear-SessionsState {
   Unregister-ScheduledJob $SessionsFireTaskName
 }
 
+function Get-AgentList {
+  # `claude agents --json --all` lists interactive AND background sessions —
+  # the same set the Claude app shows. Best-effort; never throws.
+  try {
+    $json = (& claude agents --json --all 2>$null | Out-String)
+    if ([string]::IsNullOrWhiteSpace($json)) { return @() }
+    return @($json | ConvertFrom-Json)
+  } catch { return @() }
+}
+
+function Get-LiveSessionIds {
+  # Session ids currently held by a running process. A stop line in a transcript
+  # says the session hit a limit; it does NOT say the session is gone. Three
+  # kinds of live session must never be rescued:
+  #
+  #   * the user's own open terminal — Claude Code's TUI continues by itself
+  #     after a reset, so dispatching a background copy duplicates the work in a
+  #     window the user cannot see;
+  #   * a background agent this tool dispatched earlier — rescuing it forks the
+  #     rescue, and since each fork's transcript is scanned in turn the result is
+  #     a chain that spawns one agent per tick forever;
+  #   * anything merely blocked (waiting on a permission prompt) — that is a
+  #     stalled session needing a human, not a stranded one needing a resume.
+  #
+  # On 2026-08-01 the absence of this check forked a live interactive session
+  # three deep (d161c87e -> 8382ddbb -> ecf5b6d2 -> 210b4578) in half an hour.
+  # An empty result means "could not tell" and is deliberately non-blocking: the
+  # processed ledger and the fire-time buffer still bound the damage.
+  $live = @{}
+  foreach ($a in (Get-AgentList)) {
+    $sid = [string]$a.sessionId
+    if (-not $sid) { continue }
+    # A pid is the strongest signal: something is attached to it right now.
+    $alive = [bool]$a.pid
+    # Terminal states are the only ones safe to treat as finished.
+    $state = ([string]$a.state).ToLowerInvariant()
+    if ($state -and $state -notin @('done', 'failed', 'stopped', 'killed')) { $alive = $true }
+    if ($alive) { $live[$sid] = $true }
+  }
+  return $live
+}
+
 function Scan-StrandedSessions {
   # Every *.jsonl directly under a project dir (subagent transcripts live in
   # subdirectories and are skipped), touched within the scan window — plus any
@@ -697,11 +691,18 @@ function Scan-StrandedSessions {
     }
   }
   $processed = Get-ProcessedSessions
+  $live      = Get-LiveSessionIds
   $found = @()
   foreach ($f in $files) {
     $hit = Find-StrandedSession $f.FullName
     if ($null -eq $hit) { continue }
     if (Test-ProcessedSession $processed $hit.SessionId $hit.LimitTs) { continue }
+    if ($live.ContainsKey($hit.SessionId)) {
+      # Not processed and not stranded — just busy. Skipped silently rather than
+      # recorded, so it stays eligible once the process really does go away.
+      Log ("session-rescue: {0} is still live; not a rescue target." -f $hit.SessionId)
+      continue
+    }
     $found += $hit
   }
   return $found
@@ -714,12 +715,8 @@ function Register-SessionsFireTask([datetime]$fireAt) {
 }
 
 function Get-BackgroundAgentState([string]$bgId) {
-  # `claude agents --json --all` lists interactive AND background sessions —
-  # the same set the Claude app shows. Best-effort; never throws.
   try {
-    $json = (& claude agents --json --all 2>$null | Out-String)
-    if ([string]::IsNullOrWhiteSpace($json)) { return $null }
-    foreach ($a in @($json | ConvertFrom-Json)) {
+    foreach ($a in (Get-AgentList)) {
       if ($a.id -eq $bgId -or ([string]$a.sessionId).StartsWith($bgId)) {
         if ($a.state)  { return [string]$a.state }
         if ($a.status) { return [string]$a.status }
@@ -800,16 +797,6 @@ function Show-RescueToast([string]$title, [string]$body) {
   # by the time this runs, and a missing module, a headless box or a locked-down
   # session must never turn a completed rescue into a failed one. When this
   # returns $false the notice file says so, and becomes the only signal.
-  if ($script:Platform -eq 'macOS') {
-    try {
-      # Quotes are the only thing that can break the -e string; swap rather than
-      # escape, since the text is a human-readable summary either way.
-      $t = $title -replace '"', "'"
-      $b = $body  -replace '"', "'"
-      & osascript -e "display notification `"$b`" with title `"$t`"" 2>$null | Out-Null
-      return ($LASTEXITCODE -eq 0)
-    } catch { return $false }
-  }
   if ($script:Platform -eq 'Linux') {
     try {
       if (Get-Command notify-send -ErrorAction SilentlyContinue) {
@@ -880,16 +867,24 @@ and in `claude agents`, rather than running where nobody can see it.
 `resume` into the frozen window starts a second run that redoes finished work;
 that cost a duplicated pass on 2026-07-31.
 
-Watch, steer or stop it:
+Watch, steer or stop it — **`attach` is the way in, not `--resume`**:
 
-    claude agents           # lists it, with state
-    claude attach {8}  # open it in this terminal
-    claude logs {8}    # recent output
+    claude agents          # lists it, with state
+    claude attach {8}      # open it in this terminal
+    claude logs {8}        # recent output
+    claude stop {8}        # end it
 
-Or open the original conversation fresh:
+`claude --resume {8}` will refuse while the agent is running, and answers
+`No conversation found` for the original id below unless **both** of these hold:
+the frozen terminal has been closed (`--resume` skips sessions a live process is
+holding), and you are standing in the project folder (`--resume` only lists the
+current directory's sessions).
 
     cd "{6}"
-    claude --resume {1}
+    claude --resume {1}    # only after closing the original window
+
+If the agent shows `blocked / waiting for permission prompt`, it is not stuck on
+quota — it is asking for approval and nobody is there. Attach and answer it.
 
 These edits were made under `acceptEdits`, with nobody available to approve
 them. Review them before trusting them.
@@ -1160,15 +1155,13 @@ function Remove-LegacyInstall {
 function Get-StartupVbsPath { Join-Path ([Environment]::GetFolderPath('Startup')) $StartupVbsName }
 
 # The watcher's autostart, per platform: a Startup-folder shim on Windows, a
-# LaunchAgent on macOS, a systemd --user service on Linux. Unlike the scheduled
-# jobs this one is long-running, so macOS/Linux get KeepAlive/Restart.
-$WatcherLabel = 'com.quotawake.keepawake'
+# systemd --user service on Linux. Unlike the scheduled jobs this one is
+# long-running, so Linux gets Restart=always.
 $WatcherUnit  = 'quotawake-keepawake'
 
 function Get-WatcherAutostartPath {
   switch ($script:Platform) {
     'Windows' { return (Get-StartupVbsPath) }
-    'macOS'   { return (Join-Path (Join-Path $HOME 'Library/LaunchAgents') "$WatcherLabel.plist") }
     'Linux'   { return (Join-Path (Get-SystemdUnitDir) "$WatcherUnit.service") }
   }
   return $null
@@ -1178,28 +1171,6 @@ function Get-WatcherArgv {
   $pwsh = try { (Get-Process -Id $PID).Path } catch { $null }
   if (-not $pwsh) { $pwsh = 'pwsh' }
   return @($pwsh, '-NoProfile', '-NonInteractive', '-File', (Join-Path $ScriptDir 'keep-awake.ps1'))
-}
-
-function New-WatcherLaunchAgent {
-  $argXml = (Get-WatcherArgv | ForEach-Object {
-    '    <string>{0}</string>' -f [System.Security.SecurityElement]::Escape($_)
-  }) -join "`n"
-  return @"
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>$WatcherLabel</string>
-  <key>ProgramArguments</key>
-  <array>
-$argXml
-  </array>
-  <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><true/>
-  <key>ProcessType</key><string>Background</string>
-</dict>
-</plist>
-"@
 }
 
 function New-WatcherSystemdUnit {
@@ -1219,11 +1190,11 @@ WantedBy=default.target
 }
 
 function Set-UserPathEntry([switch]$Remove) {
-  # Windows only. macOS and Linux have no per-user persistent PATH a script can
-  # safely edit — it lives in whichever shell rc the user happens to use, and
-  # rewriting someone's .zshrc/.bashrc uninvited is not this tool's business.
-  # Those platforms rely on the `qw` function written into the PowerShell
-  # profile, which works from any directory regardless of PATH.
+  # Windows only. Linux has no per-user persistent PATH a script can safely edit
+  # — it lives in whichever shell rc the user happens to use, and rewriting
+  # someone's .bashrc uninvited is not this tool's business. Linux relies on the
+  # `qw` function written into the PowerShell profile, which works from any
+  # directory regardless of PATH.
   if ($script:Platform -ne 'Windows') { return $false }
   # Also drops any quotawake folder that no longer exists — exactly what a
   # move leaves behind, and a stale PATH entry is pure confusion later.
@@ -1286,14 +1257,6 @@ function Set-WatcherAutostart([switch]$Remove) {
         ('objShell.Run "pwsh -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File ""{0}""", 0, False' -f $ps1)
       )
     }
-    'macOS' {
-      & launchctl bootout "gui/$(id -u)/$WatcherLabel" 2>$null | Out-Null
-      if ($Remove) { Remove-Item -LiteralPath $target -Force -ErrorAction SilentlyContinue; return }
-      New-Item -ItemType Directory -Force -Path (Split-Path -Parent $target) | Out-Null
-      Set-Content -LiteralPath $target -Value (New-WatcherLaunchAgent) -Encoding UTF8
-      & launchctl bootstrap "gui/$(id -u)" $target 2>$null | Out-Null
-      if ($LASTEXITCODE -ne 0) { & launchctl load -w $target 2>$null | Out-Null }
-    }
     'Linux' {
       if ($Remove) {
         [void](Invoke-Systemctl @('disable', '--now', "$WatcherUnit.service"))
@@ -1317,6 +1280,11 @@ function Set-WatcherAutostart([switch]$Remove) {
 if ($SelfTest) { return }
 
 # ---------- entry points ----------
+# Every path below ends in a backend call, so refuse an unsupported OS here
+# rather than letting each switch fall through to a silent no-op. -Doctor is
+# exempt: reporting *why* the platform is unsupported is exactly its job.
+if (-not $Doctor) { Assert-SupportedPlatform }
+
 $script:DoctorFailures = 0
 function Test-Doctor([string]$label, [bool]$pass, [string]$detail = '', [switch]$Warn) {
   $tag = if ($pass) { 'OK  ' } elseif ($Warn) { 'WARN' } else { 'FAIL' }
@@ -1327,7 +1295,8 @@ function Test-Doctor([string]$label, [bool]$pass, [string]$detail = '', [switch]
 if ($Doctor) {
   Write-Host "quotawake doctor — $($script:Platform), pwsh $($PSVersionTable.PSVersion), $ScriptDir`n"
 
-  Test-Doctor "platform recognised" ($script:Platform -ne 'Unknown') $script:Platform
+  Test-Doctor "platform supported" ($script:Platform -in @('Windows','Linux')) `
+    $(if ($script:Platform -eq 'macOS') { "macOS - no tested backend (see ac11ea2)" } else { $script:Platform })
   Test-Doctor "pwsh 7+" ($PSVersionTable.PSVersion.Major -ge 7) $PSVersionTable.PSVersion.ToString()
   $claude = Get-Command claude -ErrorAction SilentlyContinue
   Test-Doctor "claude CLI on PATH" ([bool]$claude) $(if ($claude) { $claude.Source } else { 'not found - rescue cannot run' })
@@ -1337,7 +1306,6 @@ if ($Doctor) {
   # fires, and that failure is silent, so prove it by actually registering.
   $backend = switch ($script:Platform) {
     'Windows' { if (Get-Command Register-ScheduledTask -ErrorAction SilentlyContinue) { 'Task Scheduler' } else { $null } }
-    'macOS'   { if (Get-Command launchctl -ErrorAction SilentlyContinue) { 'launchd' } else { $null } }
     'Linux'   { if ((Get-Command systemctl -ErrorAction SilentlyContinue) -and (Invoke-Systemctl @('show', '--property=Version'))) { 'systemd --user' } else { $null } }
   }
   Test-Doctor "scheduler backend" ([bool]$backend) $(if ($backend) { $backend } else { 'unavailable - nothing will ever fire' })
@@ -1362,7 +1330,6 @@ if ($Doctor) {
 
   $awake = switch ($script:Platform) {
     'Windows' { 'SetThreadExecutionState (built in)' }
-    'macOS'   { if (Get-Command caffeinate -ErrorAction SilentlyContinue) { 'caffeinate' } else { $null } }
     'Linux'   { if (Get-Command systemd-inhibit -ErrorAction SilentlyContinue) { 'systemd-inhibit' } else { $null } }
   }
   Test-Doctor "keep-awake mechanism" ([bool]$awake) $(if ($awake) { $awake } else { 'missing - machine may sleep through a reset' }) -Warn:(-not $awake)
@@ -1402,7 +1369,6 @@ if ($Install) {
   Set-WatcherAutostart
   $backendName = switch ($script:Platform) {
     'Windows' { "scheduled task '$LogonTaskName'" }
-    'macOS'   { "launchd agent '$(Get-LaunchdLabel $LogonTaskName)'" }
     'Linux'   { "systemd --user timer '$(Get-SystemdUnitName $LogonTaskName).timer'" }
     default   { "reconciler '$LogonTaskName'" }
   }
@@ -1423,7 +1389,6 @@ if ($Install) {
   Write-Host "path first. To start the new one without waiting for a logon:"
   switch ($script:Platform) {
     'Windows' { Write-Host ("  wscript `"{0}`"" -f (Get-WatcherAutostartPath)) }
-    'macOS'   { Write-Host "  launchctl kickstart -k gui/`$(id -u)/$WatcherLabel" }
     'Linux'   { Write-Host "  systemctl --user restart $WatcherUnit.service" }
   }
   exit 0

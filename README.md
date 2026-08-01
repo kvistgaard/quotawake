@@ -2,7 +2,7 @@
 
 Auto-resumes **Claude Code** work across usage-limit resets. Claude Code has no
 event that fires on "usage limit reached" and no built-in resume when the window
-reopens — this fills that gap on **Windows, macOS and Linux**, with no resident
+reopens — this fills that gap on **Windows and Linux**, with no resident
 process.
 
 Two independent things live here:
@@ -21,16 +21,16 @@ Two independent things live here:
 ## Platforms
 
 Everything OS-specific sits behind one narrow contract — register a job, remove
-it, ask whether it exists — with three backends:
+it, ask whether it exists — with two backends:
 
-| | Windows | macOS | Linux |
-|---|---|---|---|
-| Scheduling | Task Scheduler | launchd (`~/Library/LaunchAgents`) | `systemd --user` timers |
-| Fires after sleep/off | `StartWhenAvailable` | launchd catch-up on wake | `Persistent=true` |
-| Notification | WinRT toast / BurntToast | `osascript` | `notify-send` |
-| Keep-awake | `SetThreadExecutionState` | `caffeinate -s` | `systemd-inhibit` |
-| AC detection | WinForms `PowerStatus` | `pmset -g batt` | `/sys/class/power_supply` |
-| Autostart | Startup-folder shim | LaunchAgent (`KeepAlive`) | user service (`Restart=always`) |
+| | Windows | Linux |
+|---|---|---|
+| Scheduling | Task Scheduler | `systemd --user` timers |
+| Fires after sleep/off | `StartWhenAvailable` | `Persistent=true` |
+| Notification | WinRT toast / BurntToast | `notify-send` |
+| Keep-awake | `SetThreadExecutionState` | `systemd-inhibit` |
+| AC detection | WinForms `PowerStatus` | `/sys/class/power_supply` |
+| Autostart | Startup-folder shim | user service (`Restart=always`) |
 
 **Verification status — read this before trusting it.**
 
@@ -39,11 +39,14 @@ it, ask whether it exists — with three backends:
   the `.timer` and `.service` files are accepted with no complaints, and the
   `OnCalendar` value normalises to the intended instant. The `systemctl` calls
   themselves are not exercised here.
-- **macOS is unverified.** It was written against launchd's documented
-  behaviour and its plist generation is unit-tested (well-formed XML, correct
-  label, calendar fields, `RunAtLoad`), but no Mac was available to run it.
+- **macOS is not supported.** A launchd backend was written and then removed,
+  because there was no Mac to run it on. Every earlier failure in this project
+  looked like a success from the outside, so an untested scheduler backend —
+  which fails by registering nothing, silently — was not worth shipping.
+  `quotawake` refuses to run on macOS by name rather than half-working. The
+  implementation is in git if a Mac turns up: `git show ac11ea2 -- quotawake.ps1`.
 
-Because of that, every platform ships with a self-check that proves the
+Because of that, both platforms ship with a self-check that proves the
 integration where it actually runs, including a real register/unregister
 round-trip against the live scheduler:
 
@@ -55,9 +58,9 @@ Run it first on any new machine. If the scheduler line fails, nothing will ever
 fire — and that failure is otherwise silent.
 
 **One deliberate non-goal:** nothing here wakes a sleeping machine. That needs
-wake timers on Windows (AC-only under typical laptop policy) and root on
-macOS/Linux. A rescue whose moment passes while the machine is asleep runs at
-the next wake instead — delayed, never lost.
+wake timers on Windows (AC-only under typical laptop policy) and root on Linux.
+A rescue whose moment passes while the machine is asleep runs at the next wake
+instead — delayed, never lost.
 
 ## Timing: why nothing stays running
 
@@ -252,11 +255,16 @@ notice anyway.
   handles many sessions per batch.)
 - **A sleeping machine delays a resume, never loses it.** Nothing here wakes a
   sleeping machine: Windows needs wake timers (policy-enabled on AC, disabled on
-  battery on most laptops — deliberately, to keep battery economic) and
-  macOS/Linux need root. The resume fires the moment the machine is next awake,
-  or at the following reconcile pass.
-- **macOS is untested.** Written to launchd's documented behaviour with its
-  plist generation unit-tested, but never run on a Mac. Run `-Doctor` first.
+  battery on most laptops — deliberately, to keep battery economic) and Linux
+  needs root. The resume fires the moment the machine is next awake, or at the
+  following reconcile pass.
+- **A session that is still running is never rescued.** A limit line records
+  that a session *hit* a limit, not that it stopped, so live sessions are
+  skipped: resuming one forks it instead of continuing it. Your own open
+  terminal continues by itself after a reset — that is Claude Code's behaviour,
+  not this tool's.
+- **macOS is not supported.** `-Doctor` says so; every other entry point
+  refuses outright. See Platforms above.
 
 ## Exit codes
 
@@ -269,18 +277,19 @@ otherwise Claude's own non-zero exit code.
 pwsh -File quotawake.Tests.ps1
 ```
 
-100 assertions against a mocked `claude` and mocked task registration — no real
+102 assertions against a mocked `claude` and mocked task registration — no real
 runs, no task registered, no quota spent. Covers limit detection, reset-time
 parsing (including anchored parsing), `-At` parsing, state round-trips, the full
 round logic, stranded-session detection (including the regressions that once made
-rescue fail silently), the arming/holding/firing cycle, the notice and toast, and
-the launchd/systemd generators.
+rescue fail silently, and the live-session rule that stopped it forking running
+sessions), the arming/holding/firing cycle, the notice and toast, the systemd
+generators, and the refusal to run on an unsupported OS.
 
-The OS-specific backends are written as **pure generators** returning plist and
-unit text, so the part most likely to be wrong is testable from any machine. The
-generated systemd units are additionally validated by a real `systemd-analyze
-verify`. What unit tests cannot reach — the actual `launchctl` and `systemctl`
-calls — is what `-Doctor` exists to check on the target machine.
+The OS-specific backend is written as a **pure generator** returning unit text,
+so the part most likely to be wrong is testable from any machine. The generated
+systemd units are additionally validated by a real `systemd-analyze verify`.
+What unit tests cannot reach — the actual `systemctl` calls — is what `-Doctor`
+exists to check on the target machine.
 
 ## Why it works the way it does
 

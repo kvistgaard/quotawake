@@ -116,28 +116,27 @@ Consequences worth knowing:
 ## Cross-platform, and how it was tested without the platforms
 
 The tool was Windows-only for its whole life. Porting it raised an awkward
-problem: the macOS backend cannot be exercised from a Windows machine, and this
-project's entire history is of code that looked correct and silently did
+problem: a non-Windows backend cannot be exercised from a Windows machine, and
+this project's entire history is of code that looked correct and silently did
 nothing. Shipping unverifiable code was the exact failure mode to avoid.
 
 Three things followed from that.
 
 **One narrow contract.** Everything OS-specific reduces to: register a job,
-remove it, ask whether it exists. Three backends implement it — Task Scheduler,
-launchd, `systemd --user`. Each must guarantee (1) a job whose moment passed
-while the machine was asleep or off still runs once it is back, and (2) the
-registration survives reboot. Waking a sleeping machine is explicitly not
-required, because it needs wake timers on Windows and root elsewhere; a rescue
-is delayed to the next wake, never lost.
+remove it, ask whether it exists. Two backends implement it — Task Scheduler and
+`systemd --user`. Each must guarantee (1) a job whose moment passed while the
+machine was asleep or off still runs once it is back, and (2) the registration
+survives reboot. Waking a sleeping machine is explicitly not required, because
+it needs wake timers on Windows and root on Linux; a rescue is delayed to the
+next wake, never lost.
 
-**The OS-specific parts are pure generators.** `New-LaunchdPlist` and
-`New-SystemdUnits` return text and touch nothing. That moves the part most
-likely to be wrong — the exact plist and unit content — into unit tests that run
-anywhere, leaving only the thin `launchctl` / `systemctl` invocations unproven.
-The generated systemd units are then fed to a real `systemd-analyze verify`,
-which accepted all three with no complaints and normalised the `OnCalendar`
-value to the intended instant. That is a genuine external check, not a
-self-assessment.
+**The OS-specific parts are pure generators.** `New-SystemdUnits` returns text
+and touches nothing. That moves the part most likely to be wrong — the exact
+unit content — into unit tests that run anywhere, leaving only the thin
+`systemctl` invocations unproven. The generated units are then fed to a real
+`systemd-analyze verify`, which accepted all three with no complaints and
+normalised the `OnCalendar` value to the intended instant. That is a genuine
+external check, not a self-assessment.
 
 **`-Doctor` covers the rest.** It runs on the target machine and proves the
 integration there, including registering a real one-shot job, confirming the
@@ -145,16 +144,22 @@ scheduler can see it, and removing it again. It exists because the alternative
 was asking someone to trust untested code — and on this project, that trust has
 never once been repaid.
 
-Honest status: Windows fully exercised; Linux unit generation externally
-validated; **macOS unverified**, written to launchd's documented behaviour with
-its plist generation unit-tested but never run on a Mac.
+**And macOS was dropped rather than shipped untested.** A complete launchd
+backend existed — plist generator, `launchctl bootstrap`/`bootout`, `caffeinate`
+hold, `osascript` notification, LaunchAgent autostart — with the generator
+unit-tested for well-formed XML and correct calendar fields. None of it had ever
+run on a Mac. The same principle that produced `-Doctor` applies to the decision
+itself: a scheduler backend fails by registering *nothing*, silently, which is
+indistinguishable from the four real defects this tool already shipped. Deleting
+every mention while leaving the code would have been worse still — the OS would
+be half-supported with nothing saying so. So `Get-Platform` still names macOS,
+and `Assert-SupportedPlatform` refuses it explicitly. Recoverable in full from
+`git show ac11ea2 -- quotawake.ps1` if a Mac ever becomes available.
 
-Two platform details worth knowing. On Linux, user timers die at logout unless
+One platform detail worth knowing: on Linux, user timers die at logout unless
 `loginctl enable-linger` is set — without it the tool silently stops existing
 the moment you close an SSH session; `-Install` tries, but it usually needs
-polkit or root. On macOS, a one-shot uses `StartCalendarInterval`, which
-nominally recurs yearly; that is harmless here because the job's own run clears
-the state and unregisters the plist.
+polkit or root.
 
 ## Platform gotchas that cost real debugging time
 
