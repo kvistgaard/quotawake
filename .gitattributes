@@ -1,0 +1,6 @@
+# Normalise to LF in the repository, check out native on each machine, so the
+# same clone is clean on Windows and on anything else.
+* text=auto
+
+# Windows Script Host is fussiest here; keep these CRLF on disk.
+*.vbs text eol=crlf
