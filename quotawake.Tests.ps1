@@ -180,7 +180,7 @@ $fakeHit = @{ SessionId = "zzzz-0000"; Cwd = $tmp; LimitTs = "2026-07-18T16:06:1
 $p1 = Write-RescueNotice $fakeHit "line one`nline two" ([datetime]"2026-07-18 21:50") "finished cleanly" $false
 Check "notice file created in the project folder" ($null -ne $p1 -and (Test-Path $p1))
 $t1 = Get-Content $p1 -Raw
-Check "notice explains why the window is dead"    ($t1 -match 'cannot be resumed in place')
+Check "notice explains why the window is dead"    ($t1 -match 'cannot be revived')
 Check "notice carries the run's own output"       ($t1 -like "*line two*")
 Check "notice tells you not to re-run it"         ($t1 -match 'do not re-run it by hand')
 Check "notice shows how to reopen the session"    ($t1 -match 'claude --resume zzzz-0000')
@@ -276,13 +276,17 @@ Check "resumed session recorded as handled"              (Test-ProcessedSession 
 $autoNotice = Join-Path $tmp $SessionNoticeFile
 Check "a real rescue attempts a desktop toast"           ($script:toasts.Count -eq 1)
 Check "the toast says not to re-run by hand"             ($script:toasts[0] -match 'do not re-run')
-# The whole point of --bg over -p: the rescue must be findable from the phone,
-# so the notice has to name the agent and say how to reach it.
+# The whole point of --bg over -p: the resumed session must be findable from the
+# phone, so the notice has to give its id and say how to get back into it.
 $n = Get-Content (Join-Path $tmp "QUOTAWAKE-RESUMED.md") -Raw
-Check "notice names the background agent"                ($n -match 'abcd1234')
+Check "notice gives the resumed session's id"            ($n -match 'abcd1234')
 Check "notice says it is visible in the Claude app"      ($n -match '(?i)Claude app')
+# The user must never be sent to `--resume` for the session that is running -
+# that answers "No conversation found" and reads as a broken rescue.
+Check "notice leads with the claude agents list"         ($n -match 'claude agents')
+Check "notice labels the two ids in plain words"         ($n -match 'Session that stopped' -and $n -match 'Resumed session')
 Check "notice gives the attach/logs commands"            ($n -match 'claude attach abcd1234' -and $n -match 'claude logs abcd1234')
-Check "notice carries the agent's own final message"     ($n -match 'the work is finished')
+Check "notice carries the resumed session's last words"  ($n -match 'the work is finished')
 Check "a real rescue leaves a notice in the project"     (Test-Path $autoNotice)
 Check "that notice names the rescued session"            ((Get-Content $autoNotice -Raw) -like "*ffff-9999*")
 Remove-Item $autoNotice -Force -ErrorAction SilentlyContinue
@@ -295,6 +299,29 @@ Invoke-SessionReconcile
 Check "unreachable project folder -> not resumed"        ($script:resumed.Count -eq 0)
 Check "unreachable project folder -> NOT written off"    (-not (Test-ProcessedSession (Get-ProcessedSessions) "gggg-8888" (ConvertTo-IsoUtcString $past)))
 Check "unreachable project folder -> retry re-armed"     ($script:sessArmed.Count -eq 1)
+
+# An 8-character hex id tells the user nothing about which session it is. The
+# name is the only thing in `claude agents` that can, and Claude Code derives it
+# from the prompt unless --name is given - which made every resumed session
+# read "You were interrupted by a usage-limit reset...", identical for all of
+# them. The label must name the project.
+$lbl = Get-SessionLabel ([pscustomobject]@{ Cwd = 'C:\_GitHub\my-project' })
+Check "session label names the project folder"           ($lbl -match '^my-project')
+Check "session label says when it was resumed"           ($lbl -match 'resumed \d{2}:\d{2}$')
+Check "session label survives a pathless hit"            ((Get-SessionLabel ([pscustomobject]@{ Cwd = '' })) -match 'unknown project')
+
+# The ledger doubles as the map the user opens to answer "which id is mine?".
+# Two UUIDs and a timestamp cannot answer that; project and resumed-id can.
+Remove-Item $script:ProcessedSessionsFile -Force -ErrorAction SilentlyContinue
+Add-ProcessedSession "old-1111" "2026-08-02T10:00:00Z" "C:\_GitHub\my-project" "7f3ab210" "my-project — resumed 20:04"
+$led = @(Get-ProcessedSessions)
+Check "ledger row records the project"                   ($led[0].project -eq 'my-project')
+Check "ledger row records the resumed session id"        ($led[0].resumedAs -eq '7f3ab210')
+Check "ledger row records the full project path"         ($led[0].projectPath -eq 'C:\_GitHub\my-project')
+# Duplicate suppression must keep working across the added fields, or a resumed
+# session gets resumed a second time.
+Check "ledger still suppresses a handled pair"           (Test-ProcessedSession $led "old-1111" (ConvertTo-IsoUtcString "2026-08-02T10:00:00Z"))
+Remove-Item $script:ProcessedSessionsFile -Force -ErrorAction SilentlyContinue
 
 # A stop line records that a session HIT a limit. It does not record that the
 # session is gone — and a session that is still running must never be resumed,
