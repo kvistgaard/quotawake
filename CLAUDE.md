@@ -51,6 +51,13 @@ fire on its own.
   session *hit* a limit, not that it stopped. `--resume --bg` on a live session
   forks it — and since each fork's transcript is then scanned in turn, that
   chains. `Get-LiveSessionIds` is the guard; it is not optional.
+- **Never use real data from this machine in anything here.** This repo is
+  public. Every example, comment, test fixture and sample output uses invented
+  placeholders — `my-project`, `7f3ab210`, `/path/to/project` — never a real
+  project name, folder path, session id or file name observed on the system. A
+  real value in an example looks like accuracy and is actually disclosure; a
+  README leaked a private project name this way on 2026-08-02. Grep for the
+  user's name, home path and other project names before shipping docs.
 - No absolute paths. Use `$PSScriptRoot`; a hardcoded path once disabled the
   keep-awake watcher entirely.
 - Timestamps from `ConvertFrom-Json` are `Kind=Utc` and print as UTC. Normalise

@@ -108,6 +108,10 @@ param(
   # proves or disproves each piece where it actually runs.
   [switch]$Doctor,
 
+  # Show what has been resumed and how to get back into it. The one command a
+  # user needs after a rescue: which project, which session, still running?
+  [switch]$List,
+
   # Define the functions and return without running — for the test harness.
   [switch]$SelfTest
 )
@@ -589,9 +593,26 @@ function Get-ProcessedSessions {
   return @()
 }
 
-function Add-ProcessedSession([string]$sessionId, [string]$limitTs) {
+function Add-ProcessedSession([string]$sessionId, [string]$limitTs, [string]$cwd = '', [string]$resumedAs = '', [string]$label = '') {
+  # This file is not only a duplicate-suppression ledger — it is the map the
+  # user opens to answer "which of these ids is mine?". A row of two UUIDs and
+  # a timestamp cannot answer that, so every row also carries the project it
+  # belongs to, the name shown in `claude agents`, and the id of the session
+  # that took over. Extra fields are optional: older rows stay readable.
   $all = @(Get-ProcessedSessions | Where-Object { -not ($_.sessionId -eq $sessionId -and $_.limitTs -eq $limitTs) })
-  $all += [pscustomobject]@{ sessionId = $sessionId; limitTs = $limitTs; handled = (Get-Date).ToString("o") }
+  $row = [ordered]@{
+    project      = $(if ($cwd) { try { Split-Path -Leaf $cwd } catch { '' } } else { '' })
+    name         = $label
+    resumedAs    = $resumedAs
+    stoppedId    = $sessionId
+    projectPath  = $cwd
+    limitTs      = $limitTs
+    handled      = (Get-Date).ToString("o")
+    # Kept under the original key as well: Test-ProcessedSession matches on it,
+    # and so do the rows written before this file grew the friendlier fields.
+    sessionId    = $sessionId
+  }
+  $all += [pscustomobject]$row
   ConvertTo-Json -InputObject @($all | Select-Object -Last 200) -Depth 5 |
     Set-Content -Path $script:ProcessedSessionsFile -Encoding UTF8
 }
@@ -652,7 +673,7 @@ function Get-LiveSessionIds {
   #     stalled session needing a human, not a stranded one needing a resume.
   #
   # On 2026-08-01 the absence of this check forked a live interactive session
-  # three deep (d161c87e -> 8382ddbb -> ecf5b6d2 -> 210b4578) in half an hour.
+  # three deep (one live window -> its rescue -> its rescue) in half an hour.
   # An empty result means "could not tell" and is deliberately non-blocking: the
   # processed ledger and the fire-time buffer still bound the damage.
   $live = @{}
@@ -751,6 +772,15 @@ function Get-LastAssistantText([string]$path) {
   return ''
 }
 
+function Get-SessionLabel($hit) {
+  # The name a human will scan for in `claude agents`: project folder, then the
+  # time it was resumed. Kept short — the picker truncates — and free of the
+  # word "session", which every row already is.
+  $leaf = try { Split-Path -Leaf $hit.Cwd } catch { '' }
+  if (-not $leaf) { $leaf = 'unknown project' }
+  return ("{0} — resumed {1}" -f $leaf, (Get-Date -Format 'HH:mm'))
+}
+
 function Invoke-SessionResume($hit) {
   # Dispatched with --bg, NOT -p. A -p run registers no session at all: it never
   # appears in `claude agents`, so the Claude app — and therefore the user's
@@ -759,10 +789,18 @@ function Invoke-SessionResume($hit) {
   # made a working rescue indistinguishable from a broken one. --bg returns
   # immediately, registers a real background session under a fresh id, and is
   # watchable and steerable from mobile.
-  $resumeArgs = @("--resume", $hit.SessionId, "--bg", "--permission-mode", $SessionPermissionMode, $SessionResumeTask)
+  # --name is what makes the result findable. Without it Claude Code names a
+  # background session after its prompt, so every resumed session was called
+  # "You were interrupted by a usage-limit reset…" — identical for all of them,
+  # in a list where the id is 8 random hex characters. Naming it after the
+  # project folder and the time means the list answers "which one is mine?"
+  # on sight, which is the whole job of that list.
+  $label = Get-SessionLabel $hit
+  $resumeArgs = @("--resume", $hit.SessionId, "--bg", "--name", $label,
+                  "--permission-mode", $SessionPermissionMode, $SessionResumeTask)
   Log ("session-rescue: claude " + ($resumeArgs -join " ") + "   [in $($hit.Cwd)]")
-  # -LiteralPath: real project folders here include names like ".A-C" and paths
-  # with spaces; wildcard interpretation of a project path is never wanted.
+  # -LiteralPath: project folder names can start with a dot or contain spaces
+  # and brackets; wildcard interpretation of a project path is never wanted.
   Push-Location -LiteralPath $hit.Cwd
   try {
     $out = ($null | & claude @resumeArgs 2>&1 | Out-String)
@@ -848,15 +886,16 @@ $script:RescueNoticeTemplate = @'
 
 ## Resumed automatically — {0}
 
-The terminal that hit the usage limit **cannot be resumed in place** — nothing
-outside a running Claude Code session can type into it. The work was dispatched
-as a **background agent**, so it is visible in the Claude app (phone included)
-and in `claude agents`, rather than running where nobody can see it.
+Your session stopped at a usage limit and has been resumed. The window it
+stopped in **cannot be revived** — nothing outside a running Claude Code session
+can type into it — so the conversation was reopened in a **new session**, which
+is why the two ids below differ. It runs in the background, so it also shows up
+in the Claude app, phone included.
 
 | | |
 |---|---|
-| Original session | `{1}` |
-| Background agent | `{8}` |
+| Session that stopped | `{1}` |
+| Resumed session | `{8}` |
 | Limit hit (UTC) | {2} |
 | Reset announced | {3} |
 | Resumed at | {0} |
@@ -864,32 +903,37 @@ and in `claude agents`, rather than running where nobody can see it.
 | Desktop notification | {5} |
 
 **This work is already running or done — do not re-run it by hand.** Typing
-`resume` into the frozen window starts a second run that redoes finished work;
-that cost a duplicated pass on 2026-07-31.
+`resume` into the old frozen window starts a second run that redoes finished
+work; that cost a duplicated pass on 2026-07-31.
 
-Watch, steer or stop it — **`attach` is the way in, not `--resume`**:
+## To go back into the resumed session
 
-    claude agents          # lists it, with state
+    claude agents
+
+It is named after this project and the time it restarted, so it is easy to spot
+in the list. Pick it, press Enter. `qw -List` shows the same thing for
+quotawake's resumes only. Or go straight in, if you have the id:
+
     claude attach {8}      # open it in this terminal
-    claude logs {8}        # recent output
-    claude stop {8}        # end it
+    claude logs {8}        # see recent output without opening it
+    claude stop {8}        # stop it early; the conversation is kept
 
-`claude --resume {8}` will refuse while the agent is running, and answers
-`No conversation found` for the original id below unless **both** of these hold:
-the frozen terminal has been closed (`--resume` skips sessions a live process is
-holding), and you are standing in the project folder (`--resume` only lists the
-current directory's sessions).
+If the list shows it as `blocked / waiting for permission prompt`, it is not out
+of quota — it is asking for approval and nobody is there. Open it and answer.
+
+## To reopen the session that stopped, instead
 
     cd "{6}"
-    claude --resume {1}    # only after closing the original window
+    claude --resume {1}
 
-If the agent shows `blocked / waiting for permission prompt`, it is not stuck on
-quota — it is asking for approval and nobody is there. Attach and answer it.
+Both of these must be true or you get `No conversation found`: the old window is
+closed (`--resume` skips a session something still has open), and you are
+standing in the project folder (`--resume` only lists that folder's sessions).
 
-These edits were made under `acceptEdits`, with nobody available to approve
-them. Review them before trusting them.
+Edits were made under `acceptEdits`, with nobody available to approve them.
+Review them before trusting them.
 
-### What the resumed run reported
+### What the resumed session reported
 
 {7}
 '@
@@ -957,7 +1001,7 @@ function Invoke-SessionReconcile {
   if ($st -and $st.attempt) { $attempt = [int]$st.attempt }
   if ($attempt -ge $SessionMaxAttempts) {
     Log "session-rescue: still limited after $attempt attempts - giving up on this batch."
-    foreach ($h in $stranded) { Add-ProcessedSession $h.SessionId $h.LimitTs }
+    foreach ($h in $stranded) { Add-ProcessedSession $h.SessionId $h.LimitTs $h.Cwd '' 'gave up after 8 attempts' }
     Clear-SessionsState
     return
   }
@@ -1003,14 +1047,14 @@ function Invoke-SessionReconcile {
     $fresh = Find-StrandedSession $h.Transcript
     if ($null -eq $fresh -or $fresh.LimitTs -ne $h.LimitTs) {
       Log ("session-rescue: {0} already moved on by itself - skipping." -f $h.SessionId)
-      Add-ProcessedSession $h.SessionId $h.LimitTs
+      Add-ProcessedSession $h.SessionId $h.LimitTs $h.Cwd '' 'continued on its own'
       continue
     }
     if (-not (Test-Path -LiteralPath $h.Cwd)) {
-      # Do NOT write the session off here. Projects on this machine live under
-      # a cloud-sync mount (Google Drive, OneDrive), so an unreachable
-      # folder usually means the drive is unmounted or still coming up — a
-      # temporary condition, not a deleted project. Marking it processed would
+      # Do NOT write the session off here. A project can live under a
+      # cloud-sync or network mount, where an unreachable folder usually means
+      # the drive is unmounted or still coming up — a temporary condition, not
+      # a deleted project. Marking it processed would
       # forfeit the rescue permanently over a transient mount, so defer and let
       # the attempt counter below bound the retries.
       Log ("session-rescue: {0}: project folder '{1}' not reachable right now - deferring." -f $h.SessionId, $h.Cwd)
@@ -1018,7 +1062,7 @@ function Invoke-SessionReconcile {
       continue
     }
     $r = Invoke-SessionResume $h
-    Add-ProcessedSession $h.SessionId $h.LimitTs
+    Add-ProcessedSession $h.SessionId $h.LimitTs $h.Cwd $r.BgId (Get-SessionLabel $h)
     if ($r.Code -ne 0 -or -not $r.BgId) {
       Log ("session-rescue: {0} dispatch failed (exit {1}) - see output above; not retrying." -f $h.SessionId, $r.Code)
       $result = "dispatch failed (exit $($r.Code)) — see quotawake.log"
@@ -1282,8 +1326,51 @@ if ($SelfTest) { return }
 # ---------- entry points ----------
 # Every path below ends in a backend call, so refuse an unsupported OS here
 # rather than letting each switch fall through to a silent no-op. -Doctor is
-# exempt: reporting *why* the platform is unsupported is exactly its job.
-if (-not $Doctor) { Assert-SupportedPlatform }
+# exempt: reporting *why* the platform is unsupported is exactly its job, and
+# -List only reads a file.
+if (-not $Doctor -and -not $List) { Assert-SupportedPlatform }
+
+if ($List) {
+  # Answers the only question a user has after a rescue: which of these is
+  # mine, and is it still going? The ledger supplies project and name; the
+  # live agent list supplies state. Neither alone is enough — the ledger does
+  # not know what is running, and `claude agents` does not know which project a
+  # row came from once several are in flight.
+  $rows = @(Get-ProcessedSessions | Where-Object { $_.resumedAs })
+  if (-not $rows.Count) {
+    Write-Host "Nothing has been resumed yet."
+    Write-Host "Once a session is resumed it is listed here, and in ``claude agents``."
+    exit 0
+  }
+  $liveState = @{}
+  foreach ($a in (Get-AgentList)) {
+    $sid = [string]$a.sessionId
+    $short = if ($sid.Length -ge 8) { $sid.Substring(0, 8) } else { $sid }
+    $liveState[$short] = $(if ($a.state) { [string]$a.state } elseif ($a.status) { [string]$a.status } else { '' })
+  }
+  Write-Host ""
+  Write-Host ("  {0,-16}  {1,-22}  {2,-10}  {3}" -f 'Resumed at', 'Project', 'Session', 'State')
+  Write-Host ("  {0,-16}  {1,-22}  {2,-10}  {3}" -f ('-'*16), ('-'*22), ('-'*10), ('-'*10))
+  foreach ($r in ($rows | Select-Object -Last 15)) {
+    # Not a bare [datetime] cast: ConvertFrom-Json hands back Kind=Utc for a
+    # "…Z" timestamp, which would print two hours early here and be silently
+    # wrong on any machine not at UTC. ConvertTo-LocalDateTime is the one
+    # normaliser every timestamp in this script goes through.
+    $wd = ConvertTo-LocalDateTime $r.handled
+    $when = if ($wd) { $wd.ToString('yyyy-MM-dd HH:mm') } else { [string]$r.handled }
+    $proj = [string]$r.project; if (-not $proj) { $proj = '(unknown)' }
+    if ($proj.Length -gt 22) { $proj = $proj.Substring(0, 21) + '…' }
+    $short = [string]$r.resumedAs
+    $state = $liveState[$short]
+    if (-not $state) { $state = 'not running' }
+    Write-Host ("  {0,-16}  {1,-22}  {2,-10}  {3}" -f $when, $proj, $short, $state)
+  }
+  Write-Host ""
+  Write-Host "  Go back into one:   claude attach <session>"
+  Write-Host "  Or pick from a list: claude agents"
+  Write-Host ""
+  exit 0
+}
 
 $script:DoctorFailures = 0
 function Test-Doctor([string]$label, [bool]$pass, [string]$detail = '', [switch]$Warn) {
@@ -1356,7 +1443,7 @@ if ($Uninstall) {
   Set-WatcherAutostart -Remove
   [void](Set-UserPathEntry -Remove)
   [void](Remove-LegacyInstall)
-  Write-Host "Removed: state files, scheduled tasks, PATH entry, qw shortcut, watcher autostart."
+  Write-Host "Removed: state files, scheduled jobs, PATH entry, qw shortcut, watcher autostart."
   Write-Host "A watcher already running stays up until you end it or log off."
   exit 0
 }
