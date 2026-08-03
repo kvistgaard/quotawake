@@ -1,7 +1,7 @@
 # quotawake
 
 > [!CAUTION]
-> **Early release** It's been used daily but is young so expect rough edges and bugs.
+> **Early release.** It's been used daily but is young so expect rough edges and bugs.
 
 **Claude Code stops when you hit a usage limit. Quotawake starts the work again when the limit is reset – when you are asleep, away from your computer, or there but busy with something else.**
 
