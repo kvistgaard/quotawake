@@ -360,53 +360,40 @@ ScanOnly "gone-0005" @()
 Check "an unreadable agent list still allows rescue"     ($script:resumed -contains "gone-0005")
 $script:agents = @()
 
-Write-Host "== platform layer =="
-# The systemd backend cannot run on a Windows box, so everything OS-specific is
-# written as a PURE GENERATOR returning text. That makes the part most likely to
-# be wrong — the exact unit content — testable everywhere, and leaves only the
-# `systemctl` calls unverified. -Doctor covers those where they actually run.
-# (A launchd backend existed until ac11ea2 and was removed for lack of a Mac to
-# test on; macOS is now refused by name rather than half-supported.)
+Write-Host "== platform =="
+# Windows only. Backends for macOS (launchd) and Linux (systemd --user) were both
+# written and both removed: neither could be tested on the machine shipping them,
+# and a scheduler backend fails by registering NOTHING, silently. The rule that
+# replaced them is that an unsupported OS must fail loudly - without it, -Install
+# would report success having registered no job at all, which is exactly the
+# silent-success failure this tool has already shipped four times.
 $realPlatform = $script:Platform
-Check "platform detected"                 ($realPlatform -eq 'Windows')
-Check "job slug strips prefix and case"   ((Get-JobSlug 'QuotaWake-FireSessions') -eq 'firesessions')
-Check "job slug stable for Fire"          ((Get-JobSlug 'QuotaWake-Fire') -eq 'fire')
+Check "platform detected"                    ($realPlatform -eq 'Windows')
+$ok = $true; try { Assert-SupportedPlatform } catch { $ok = $false }
+Check "Windows is accepted"                  $ok
 
-$fire = [datetime]'2026-08-01 15:05:00'
-
-# An unsupported OS must fail loudly. Every backend switch below would otherwise
-# match no branch and do nothing, so -Install would report success having
-# registered no job at all — the exact silent-success failure mode this tool has
-# already shipped four times.
 $script:Platform = 'macOS'
-$threw = $false
+$threw = $false; $msg = ''
 try { Assert-SupportedPlatform } catch { $threw = $true; $msg = $_.Exception.Message }
 Check "macOS is refused, not half-supported" $threw
 Check "the refusal names the platform"       ($msg -match 'macOS')
+Check "the refusal says where the code went" ($msg -match 'ac11ea2')
+
+$script:Platform = 'Linux'
+$threw = $false; $msg = ''
+try { Assert-SupportedPlatform } catch { $threw = $true; $msg = $_.Exception.Message }
+Check "Linux is refused too"                 $threw
+Check "and points at the planned port"       ($msg -match '(?i)python')
+
 $script:Platform = 'Unknown'
 $threw = $false; try { Assert-SupportedPlatform } catch { $threw = $true }
 Check "an unknown platform is refused too"   $threw
 
-$script:Platform = 'Linux'
-$argv = Get-SelfArgv '-Reconcile'
-Check "unix argv invokes pwsh -File"      ($argv[0] -match 'pwsh' -and ($argv -contains '-File') -and ($argv -contains '-Reconcile'))
-$u = New-SystemdUnits 'QuotaWake-FireSessions' '-Reconcile' $fire 0
-Check "systemd service is oneshot"        ($u.Service -match '(?m)^Type=oneshot$')
-Check "systemd ExecStart runs the script" ($u.Service -match 'quotawake\.ps1' -and $u.Service -match '\-Reconcile')
-Check "systemd timer: exact moment"       ($u.Timer -match '(?m)^OnCalendar=2026-08-01 15:05:00$')
-# Persistent=true is the systemd spelling of StartWhenAvailable. Without it a
-# timer whose moment passed while the machine was off never runs at all, which
-# is the whole guarantee this tool rests on.
-Check "systemd timer is Persistent"       ($u.Timer -match '(?m)^Persistent=true$')
-Check "systemd timer installs correctly"  ($u.Timer -match '(?m)^WantedBy=timers\.target$')
-$ur = New-SystemdUnits 'QuotaWake-Logon' '-Reconcile' $null 15
-Check "systemd recurring: 15min interval" ($ur.Timer -match '(?m)^OnUnitActiveSec=15min$')
-Check "systemd recurring: fires at boot"  ($ur.Timer -match '(?m)^OnBootSec=')
-Check "watcher unit restarts on failure"  ((New-WatcherSystemdUnit) -match '(?m)^Restart=always$')
-Check "watcher unit runs keep-awake"      ((New-WatcherSystemdUnit) -match 'keep-awake\.ps1')
-
 $script:Platform = $realPlatform
-Check "platform restored"                 ($script:Platform -eq 'Windows')
+Check "platform restored"                    ($script:Platform -eq 'Windows')
+# The .vbs shim is what stops Task Scheduler flashing a console on every pass.
+$argv = Get-SelfArgv '-Reconcile'
+Check "self-argv goes through the vbs shim"  ($argv[0] -eq 'wscript.exe' -and $argv[1] -match 'run-hidden\.vbs' -and $argv[1] -match '\-Reconcile')
 
 Write-Host ""
 $col = if ($script:fail -eq 0) { "Green" } else { "Red" }

@@ -31,3 +31,11 @@ QUOTAWAKE-RESUMED.md
 # DESIGN-NOTES.md; this copy is kept locally only because it also records
 # machine specifics and home paths that should not be published. Safe to delete.
 remote-control-keepawake-handoff.md
+
+# The reference material moved out of the README's collapsed sections. Held back
+# until it is finished — un-ignore it and link it from the README then.
+REFERENCE.md
+
+# Private working notes: what is outstanding, what is parked and why. Never
+# published; it records machine specifics and half-formed decisions.
+BACKLOG.md
