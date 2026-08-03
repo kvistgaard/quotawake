@@ -32,6 +32,11 @@ QUOTAWAKE-RESUMED.md
 # machine specifics and home paths that should not be published. Safe to delete.
 remote-control-keepawake-handoff.md
 
+# Internal design reasoning: why each rule exists and which failure produced it.
+# Kept local. It was published briefly and untracked again — note that untracking
+# does not erase it from the repository's history.
+DESIGN-NOTES.md
+
 # The reference material moved out of the README's collapsed sections. Held back
 # until it is finished — un-ignore it and link it from the README then.
 REFERENCE.md

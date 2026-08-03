@@ -1,8 +1,10 @@
 # Working on quotawake
 
-Read `DESIGN-NOTES.md` before changing behaviour. Nearly every decision here was
-made in response to a specific silent failure, and the obvious simplification is
-usually the thing that was already tried and broke.
+Nearly every decision here was made in response to a specific silent failure, and
+the obvious simplification is usually the thing that was already tried and broke.
+The reasoning is kept in `DESIGN-NOTES.md`, which is **not published** — if you
+have it locally, read it before changing behaviour; the rules below are the parts
+that must hold either way.
 
 ## The failure mode to design against
 
@@ -15,7 +17,7 @@ Concretely:
 - **Never widen "the session recovered".** A stop is cleared only by an assistant
   turn, at or after the announced reset, that uses a tool. Three looser
   definitions each shipped, each looked right, and each silently cancelled real
-  rescues. See DESIGN-NOTES.
+  rescues.
 - **Never discard an arming on one empty scan.** Unregistering a task that has not
   fired yet is unrecoverable.
 - **Bias toward resuming.** A needless resume costs a run that replies DONE; a
@@ -35,18 +37,18 @@ fire on its own.
 
 ## House rules
 
-- **OS-specific code must be a pure generator plus a thin call.** Return the
-  unit/command as text from a function that touches nothing, then execute it
-  separately. That is what makes the Linux backend testable from a machine that
-  is not Linux. Never inline OS-specific text into the code that runs it.
 - **Anything you cannot test here must be checkable by `-Doctor`.** If you add a
   platform capability, add the corresponding check.
-- **Do not add a platform you cannot test.** Windows and Linux are supported;
-  macOS is refused by name in `Assert-SupportedPlatform`. A launchd backend was
-  written and removed at `ac11ea2` for exactly this reason — a scheduler backend
-  fails by registering nothing, silently, which is how this tool was already
-  broken four times. If you delete a platform, delete the code too and keep the
-  explicit refusal; a half-supported OS with no warning is the worst outcome.
+- **Do not add a platform you cannot test.** Windows only. macOS (launchd, at
+  `ac11ea2`) and Linux (systemd, removed later) were both written and both
+  deleted for the same reason — a scheduler backend fails by registering
+  nothing, silently, which is how this tool was already broken four times. Both
+  are refused by name in `Assert-SupportedPlatform`. If you delete a platform,
+  delete the code too and keep the explicit refusal; a half-supported OS with no
+  warning is the worst outcome. If you add one back, its OS-specific text must
+  be a **pure generator** — text returned by a function that touches nothing,
+  executed separately — so the part most likely to be wrong is testable from a
+  machine that is not the target.
 - **Never resume a session that is still running.** A limit line means the
   session *hit* a limit, not that it stopped. `--resume --bg` on a live session
   forks it — and since each fork's transcript is then scanned in turn, that
