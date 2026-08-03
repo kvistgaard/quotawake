@@ -102,10 +102,9 @@ param(
   # Remove the logon task, any armed one-shot task, and the state file.
   [switch]$Uninstall,
 
-  # Check that this machine's platform integration actually works, and exit.
-  # This exists because the Linux backend cannot be exercised from a Windows
-  # development box: rather than asking anyone to trust untested code, -Doctor
-  # proves or disproves each piece where it actually runs.
+  # Check that this machine's integration actually works, and exit. Registering
+  # a scheduled job is the one thing that cannot be faked or inferred: when it
+  # fails it fails silently, so -Doctor proves it by doing it for real.
   [switch]$Doctor,
 
   # Show what has been resumed and how to get back into it. The one command a
@@ -277,26 +276,31 @@ function Clear-PendingState {
 #   Unregister-ScheduledJob -Name <n>
 #   Test-ScheduledJob -Name <n>   -> [bool]
 #
-# A backend must provide two guarantees, both load-bearing:
+# The backend must provide two guarantees, both load-bearing:
 #   1. a job whose moment passed while the machine was asleep or off still runs
-#      once the machine is back  (Windows StartWhenAvailable / systemd
-#      Persistent=true);
+#      once the machine is back  (Windows: StartWhenAvailable);
 #   2. the registration survives reboot and logoff.
-# Waking a *sleeping* machine is explicitly NOT required: on Windows it needs
-# wake timers (AC-only on typical laptop policy) and on Linux it needs root. So
-# a rescue is delayed to the next wake, never lost — the same behaviour Windows
-# already has on battery.
+# Waking a *sleeping* machine is explicitly NOT required: that needs wake timers,
+# which are AC-only under typical laptop policy. So a rescue is delayed to the
+# next wake, never lost.
 #
-# Supported: Windows and Linux. A launchd backend for macOS was written and then
-# removed at ac11ea2 because there was no Mac to test it on, and an untested
-# backend that silently registers nothing is worse than none at all — this tool
-# has already been broken four times by failures that looked like successes.
-# `git show ac11ea2 -- quotawake.ps1` has it if a Mac ever becomes available.
+# Windows only. Backends for macOS (launchd) and Linux (systemd --user) were both
+# written and both removed, for the same reason: neither could be tested on the
+# machine that has to ship them, and a scheduler backend fails by registering
+# *nothing*, silently — indistinguishable from working until the day you need it.
+# This tool has already been broken four times by failures that looked like
+# successes. Both are in git if someone with the hardware wants to revive them:
+#   launchd  — git show ac11ea2 -- quotawake.ps1
+#   systemd  — the commit before this one; unit generation was validated against
+#              a real `systemd-analyze verify`, so it is a genuine head start.
+# A native Linux version (Python, not PowerShell) is the intended direction.
 
 function Get-Platform {
   if ($PSVersionTable.PSVersion.Major -lt 6) { return 'Windows' }  # 5.1 has no $IsWindows
   if ($IsWindows) { return 'Windows' }
-  if ($IsMacOS)   { return 'macOS' }   # detected only so it can be refused by name
+  # macOS and Linux are still detected by name, purely so they can be refused
+  # with a useful message rather than falling through to a silent no-op.
+  if ($IsMacOS)   { return 'macOS' }
   if ($IsLinux)   { return 'Linux' }
   return 'Unknown'
 }
@@ -307,141 +311,57 @@ function Assert-SupportedPlatform {
   # matching branch does nothing at all — quietly. On an unsupported OS that
   # would mean -Install reporting success while registering no job whatsoever.
   # Fail loudly instead, at the one place all entry points pass through.
-  if ($script:Platform -in @('Windows', 'Linux')) { return }
-  $extra = if ($script:Platform -eq 'macOS') {
-    "The launchd backend was removed at ac11ea2 because it could not be tested."
-  } else { "" }
-  throw ("quotawake supports Windows and Linux; this is '{0}'. {1}" -f $script:Platform, $extra).Trim()
-}
-
-function Get-JobSlug([string]$name) {
-  # 'QuotaWake-FireSessions' -> 'firesessions'; used for systemd unit names,
-  # which are lowercase-by-convention and must be stable.
-  return (($name -replace '^QuotaWake-', '') -replace '[^A-Za-z0-9]', '').ToLowerInvariant()
+  if ($script:Platform -eq 'Windows') { return }
+  $extra = switch ($script:Platform) {
+    'macOS' { "The launchd backend was removed at ac11ea2 because it could not be tested." }
+    'Linux' { "The systemd backend was removed for the same reason; a native Python version is planned." }
+    default { "" }
+  }
+  throw ("quotawake supports Windows only; this is '{0}'. {1}" -f $script:Platform, $extra).Trim()
 }
 
 function Get-SelfArgv([string]$arguments) {
   # argv that re-runs this script with $arguments, without a console window.
-  # Windows keeps the .vbs shim (Task Scheduler would otherwise flash a
-  # console); systemd already runs detached, so it calls pwsh.
-  if ($script:Platform -eq 'Windows') {
-    return @('wscript.exe', ('"{0}" {1}' -f $HiddenLauncher, $arguments))
-  }
-  $pwsh = try { (Get-Process -Id $PID).Path } catch { $null }
-  if (-not $pwsh) { $pwsh = 'pwsh' }
-  $argv = @($pwsh, '-NoProfile', '-NonInteractive', '-File', (Join-Path $ScriptDir 'quotawake.ps1'))
-  foreach ($a in ($arguments -split '\s+' | Where-Object { $_ })) { $argv += $a }
-  return $argv
-}
-
-# --- Linux: systemd --user ---
-function Get-SystemdUnitDir { Join-Path $HOME '.config/systemd/user' }
-function Get-SystemdUnitName([string]$name) { 'quotawake-' + (Get-JobSlug $name) }
-function New-SystemdUnits([string]$name, [string]$arguments, $fireAt, [int]$intervalMinutes) {
-  # Returns @{ Service = <text>; Timer = <text> }. Pure, so it is unit-testable
-  # off Linux and can be handed to `systemd-analyze verify`.
-  # Persistent=true is the systemd spelling of StartWhenAvailable: a timer whose
-  # moment passed while the machine was off fires once it is back.
-  $exec = ($(Get-SelfArgv $arguments) | ForEach-Object {
-    if ($_ -match '\s') { '"{0}"' -f $_ } else { $_ }
-  }) -join ' '
-  $slug = Get-JobSlug $name
-  $service = @"
-[Unit]
-Description=quotawake $slug
-
-[Service]
-Type=oneshot
-WorkingDirectory=$ScriptDir
-ExecStart=$exec
-"@
-  $timerBody = if ($null -ne $fireAt) {
-    "OnCalendar=$($fireAt.ToString('yyyy-MM-dd HH:mm:ss'))`nAccuracySec=1s"
-  } else {
-    "OnBootSec=1min`nOnUnitActiveSec=${intervalMinutes}min`nAccuracySec=30s"
-  }
-  $timer = @"
-[Unit]
-Description=quotawake $slug timer
-
-[Timer]
-$timerBody
-Persistent=true
-
-[Install]
-WantedBy=timers.target
-"@
-  return @{ Service = $service; Timer = $timer }
-}
-
-function Invoke-Systemctl([string[]]$systemctlArgs) {
-  try { & systemctl --user @systemctlArgs 2>&1 | Out-Null; return ($LASTEXITCODE -eq 0) } catch { return $false }
+  # The .vbs shim is what keeps Task Scheduler from flashing a console.
+  return @('wscript.exe', ('"{0}" {1}' -f $HiddenLauncher, $arguments))
 }
 
 # --- the contract ---
 function Register-ScheduledJob {
   param([string]$Name, [string]$Arguments, [datetime]$FireAt, [int]$IntervalMinutes)
   $once = $PSBoundParameters.ContainsKey('FireAt')
-  switch ($script:Platform) {
-    'Windows' {
-      $argv    = Get-SelfArgv $Arguments
-      $action  = New-ScheduledTaskAction -Execute $argv[0] -Argument $argv[1] -WorkingDirectory $ScriptDir
-      if ($once) {
-        $trigger  = New-ScheduledTaskTrigger -Once -At $FireAt
-        $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -WakeToRun `
-                    -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
-                    -ExecutionTimeLimit ([TimeSpan]::Zero)
-        Register-ScheduledTask -TaskName $Name -Action $action -Trigger $trigger -Settings $settings -Force | Out-Null
-      } else {
-        # AtLogOn alone was measured firing 0 times in 8 days on a Modern
-        # Standby machine (484 resumes, 0 real logons): the session suspends
-        # rather than logging off. The periodic trigger is the real coverage;
-        # AtLogOn is kept for genuine reboots. No -RepetitionDuration, because
-        # omitting it repeats indefinitely while [TimeSpan]::MaxValue overflows
-        # the task XML. -AtStartup would need elevation, breaking "no admin".
-        $atLogon  = New-ScheduledTaskTrigger -AtLogOn -User "$env:USERDOMAIN\$env:USERNAME"
-        $periodic = New-ScheduledTaskTrigger -Once -At (Get-Date) `
-                    -RepetitionInterval (New-TimeSpan -Minutes $IntervalMinutes)
-        $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable `
-                    -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
-                    -ExecutionTimeLimit (New-TimeSpan -Hours 12)
-        Register-ScheduledTask -TaskName $Name -Action $action -Trigger @($atLogon, $periodic) `
-          -Settings $settings -Force | Out-Null
-      }
-    }
-    'Linux' {
-      $dir = Get-SystemdUnitDir
-      New-Item -ItemType Directory -Force -Path $dir | Out-Null
-      $unit  = Get-SystemdUnitName $Name
-      $units = if ($once) { New-SystemdUnits $Name $Arguments $FireAt 0 }
-               else       { New-SystemdUnits $Name $Arguments $null $IntervalMinutes }
-      Set-Content -LiteralPath (Join-Path $dir "$unit.service") -Value $units.Service -Encoding UTF8
-      Set-Content -LiteralPath (Join-Path $dir "$unit.timer")   -Value $units.Timer   -Encoding UTF8
-      [void](Invoke-Systemctl @('daemon-reload'))
-      [void](Invoke-Systemctl @('enable', '--now', "$unit.timer"))
-    }
+  $argv    = Get-SelfArgv $Arguments
+  $action  = New-ScheduledTaskAction -Execute $argv[0] -Argument $argv[1] -WorkingDirectory $ScriptDir
+  if ($once) {
+    $trigger  = New-ScheduledTaskTrigger -Once -At $FireAt
+    $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -WakeToRun `
+                -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+                -ExecutionTimeLimit ([TimeSpan]::Zero)
+    Register-ScheduledTask -TaskName $Name -Action $action -Trigger $trigger -Settings $settings -Force | Out-Null
+  } else {
+    # AtLogOn alone was measured firing 0 times in 8 days on a Modern Standby
+    # machine (484 resumes, 0 real logons): the session suspends rather than
+    # logging off. The periodic trigger is the real coverage; AtLogOn is kept
+    # for genuine reboots. No -RepetitionDuration, because omitting it repeats
+    # indefinitely while [TimeSpan]::MaxValue overflows the task XML.
+    # -AtStartup would need elevation, breaking "no admin".
+    $atLogon  = New-ScheduledTaskTrigger -AtLogOn -User "$env:USERDOMAIN\$env:USERNAME"
+    $periodic = New-ScheduledTaskTrigger -Once -At (Get-Date) `
+                -RepetitionInterval (New-TimeSpan -Minutes $IntervalMinutes)
+    $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable `
+                -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+                -ExecutionTimeLimit (New-TimeSpan -Hours 12)
+    Register-ScheduledTask -TaskName $Name -Action $action -Trigger @($atLogon, $periodic) `
+      -Settings $settings -Force | Out-Null
   }
 }
 
 function Unregister-ScheduledJob([string]$Name) {
-  switch ($script:Platform) {
-    'Windows' { Unregister-ScheduledTask -TaskName $Name -Confirm:$false -ErrorAction SilentlyContinue }
-    'Linux' {
-      $unit = Get-SystemdUnitName $Name
-      [void](Invoke-Systemctl @('disable', '--now', "$unit.timer"))
-      Remove-Item -LiteralPath (Join-Path (Get-SystemdUnitDir) "$unit.service"), `
-                               (Join-Path (Get-SystemdUnitDir) "$unit.timer") -Force -ErrorAction SilentlyContinue
-      [void](Invoke-Systemctl @('daemon-reload'))
-    }
-  }
+  Unregister-ScheduledTask -TaskName $Name -Confirm:$false -ErrorAction SilentlyContinue
 }
 
 function Test-ScheduledJob([string]$Name) {
-  switch ($script:Platform) {
-    'Windows' { return [bool](Get-ScheduledTask -TaskName $Name -ErrorAction SilentlyContinue) }
-    'Linux'   { return (Test-Path -LiteralPath (Join-Path (Get-SystemdUnitDir) ((Get-SystemdUnitName $Name) + '.timer'))) }
-  }
-  return $false
+  return [bool](Get-ScheduledTask -TaskName $Name -ErrorAction SilentlyContinue)
 }
 
 # ---------- scheduled tasks (thin wrappers over the contract) ----------
@@ -835,15 +755,6 @@ function Show-RescueToast([string]$title, [string]$body) {
   # by the time this runs, and a missing module, a headless box or a locked-down
   # session must never turn a completed rescue into a failed one. When this
   # returns $false the notice file says so, and becomes the only signal.
-  if ($script:Platform -eq 'Linux') {
-    try {
-      if (Get-Command notify-send -ErrorAction SilentlyContinue) {
-        & notify-send -a quotawake -- $title $body 2>$null | Out-Null
-        return ($LASTEXITCODE -eq 0)
-      }
-    } catch {}
-    return $false   # headless boxes have no notifier at all; expected, not an error
-  }
   try {
     if (Get-Module -ListAvailable -Name BurntToast -ErrorAction SilentlyContinue) {
       Import-Module BurntToast -ErrorAction Stop
@@ -916,7 +827,7 @@ quotawake's resumes only. Or go straight in, if you have the id:
 
     claude attach {8}      # open it in this terminal
     claude logs {8}        # see recent output without opening it
-    claude stop {8}        # stop it early; the conversation is kept
+    claude stop {8}        # stop it now; nothing is lost, reopen it with attach
 
 If the list shows it as `blocked / waiting for permission prompt`, it is not out
 of quota — it is asking for approval and nobody is there. Open it and answer.
@@ -1198,18 +1109,9 @@ function Remove-LegacyInstall {
 
 function Get-StartupVbsPath { Join-Path ([Environment]::GetFolderPath('Startup')) $StartupVbsName }
 
-# The watcher's autostart, per platform: a Startup-folder shim on Windows, a
-# systemd --user service on Linux. Unlike the scheduled jobs this one is
-# long-running, so Linux gets Restart=always.
-$WatcherUnit  = 'quotawake-keepawake'
-
-function Get-WatcherAutostartPath {
-  switch ($script:Platform) {
-    'Windows' { return (Get-StartupVbsPath) }
-    'Linux'   { return (Join-Path (Get-SystemdUnitDir) "$WatcherUnit.service") }
-  }
-  return $null
-}
+# The watcher's autostart: a Startup-folder shim. Unlike the scheduled jobs it is
+# long-running, so it is started once per logon rather than on a trigger.
+function Get-WatcherAutostartPath { return (Get-StartupVbsPath) }
 
 function Get-WatcherArgv {
   $pwsh = try { (Get-Process -Id $PID).Path } catch { $null }
@@ -1217,30 +1119,8 @@ function Get-WatcherArgv {
   return @($pwsh, '-NoProfile', '-NonInteractive', '-File', (Join-Path $ScriptDir 'keep-awake.ps1'))
 }
 
-function New-WatcherSystemdUnit {
-  $exec = (Get-WatcherArgv | ForEach-Object { if ($_ -match '\s') { '"{0}"' -f $_ } else { $_ } }) -join ' '
-  return @"
-[Unit]
-Description=quotawake keep-awake watcher
-
-[Service]
-ExecStart=$exec
-Restart=always
-RestartSec=30
-
-[Install]
-WantedBy=default.target
-"@
-}
-
 function Set-UserPathEntry([switch]$Remove) {
-  # Windows only. Linux has no per-user persistent PATH a script can safely edit
-  # — it lives in whichever shell rc the user happens to use, and rewriting
-  # someone's .bashrc uninvited is not this tool's business. Linux relies on the
-  # `qw` function written into the PowerShell profile, which works from any
-  # directory regardless of PATH.
-  if ($script:Platform -ne 'Windows') { return $false }
-  # Also drops any quotawake folder that no longer exists — exactly what a
+  # Drops any quotawake folder that no longer exists — exactly what a
   # move leaves behind, and a stale PATH entry is pure confusion later.
   $cur  = @(([Environment]::GetEnvironmentVariable('PATH', 'User') -split ';') | Where-Object { $_ })
   $kept = @($cur | Where-Object {
@@ -1289,35 +1169,15 @@ function Set-AliasShortcut([switch]$Remove) {
 
 function Set-WatcherAutostart([switch]$Remove) {
   $target = Get-WatcherAutostartPath
-  switch ($script:Platform) {
-    'Windows' {
-      if ($Remove) { Remove-Item -LiteralPath $target -Force -ErrorAction SilentlyContinue; return }
-      $ps1 = Join-Path $ScriptDir 'keep-awake.ps1'
-      Set-Content -LiteralPath $target -Encoding ASCII -Value @(
-        "' Autostarts the quotawake keep-awake watcher, hidden (no console flash).",
-        "' Generated by quotawake.ps1 -Install - edit that, not this file.",
-        'Dim objShell',
-        'Set objShell = CreateObject("WScript.Shell")',
-        ('objShell.Run "pwsh -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File ""{0}""", 0, False' -f $ps1)
-      )
-    }
-    'Linux' {
-      if ($Remove) {
-        [void](Invoke-Systemctl @('disable', '--now', "$WatcherUnit.service"))
-        Remove-Item -LiteralPath $target -Force -ErrorAction SilentlyContinue
-        [void](Invoke-Systemctl @('daemon-reload'))
-        return
-      }
-      New-Item -ItemType Directory -Force -Path (Split-Path -Parent $target) | Out-Null
-      Set-Content -LiteralPath $target -Value (New-WatcherSystemdUnit) -Encoding UTF8
-      [void](Invoke-Systemctl @('daemon-reload'))
-      [void](Invoke-Systemctl @('enable', '--now', "$WatcherUnit.service"))
-      # Without lingering, user units are torn down at logout and every timer
-      # dies with the session — which would silently disable the whole tool on
-      # a machine you SSH into. Best-effort: it usually needs polkit or root.
-      try { & loginctl enable-linger $env:USER 2>$null | Out-Null } catch {}
-    }
-  }
+  if ($Remove) { Remove-Item -LiteralPath $target -Force -ErrorAction SilentlyContinue; return }
+  $ps1 = Join-Path $ScriptDir 'keep-awake.ps1'
+  Set-Content -LiteralPath $target -Encoding ASCII -Value @(
+    "' Autostarts the quotawake keep-awake watcher, hidden (no console flash).",
+    "' Generated by quotawake.ps1 -Install - edit that, not this file.",
+    'Dim objShell',
+    'Set objShell = CreateObject("WScript.Shell")',
+    ('objShell.Run "pwsh -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File ""{0}""", 0, False' -f $ps1)
+  )
 }
 
 # --- when dot-sourced for testing, stop here: functions + $limitPattern defined ---
@@ -1382,8 +1242,8 @@ function Test-Doctor([string]$label, [bool]$pass, [string]$detail = '', [switch]
 if ($Doctor) {
   Write-Host "quotawake doctor — $($script:Platform), pwsh $($PSVersionTable.PSVersion), $ScriptDir`n"
 
-  Test-Doctor "platform supported" ($script:Platform -in @('Windows','Linux')) `
-    $(if ($script:Platform -eq 'macOS') { "macOS - no tested backend (see ac11ea2)" } else { $script:Platform })
+  Test-Doctor "platform supported" ($script:Platform -eq 'Windows') `
+    $(if ($script:Platform -eq 'Windows') { 'Windows' } else { "$($script:Platform) - Windows only; no tested backend here" })
   Test-Doctor "pwsh 7+" ($PSVersionTable.PSVersion.Major -ge 7) $PSVersionTable.PSVersion.ToString()
   $claude = Get-Command claude -ErrorAction SilentlyContinue
   Test-Doctor "claude CLI on PATH" ([bool]$claude) $(if ($claude) { $claude.Source } else { 'not found - rescue cannot run' })
@@ -1391,10 +1251,7 @@ if ($Doctor) {
 
   # The scheduler is the one piece that cannot be faked: without it nothing ever
   # fires, and that failure is silent, so prove it by actually registering.
-  $backend = switch ($script:Platform) {
-    'Windows' { if (Get-Command Register-ScheduledTask -ErrorAction SilentlyContinue) { 'Task Scheduler' } else { $null } }
-    'Linux'   { if ((Get-Command systemctl -ErrorAction SilentlyContinue) -and (Invoke-Systemctl @('show', '--property=Version'))) { 'systemd --user' } else { $null } }
-  }
+  $backend = if (Get-Command Register-ScheduledTask -ErrorAction SilentlyContinue) { 'Task Scheduler' } else { $null }
   Test-Doctor "scheduler backend" ([bool]$backend) $(if ($backend) { $backend } else { 'unavailable - nothing will ever fire' })
 
   if ($backend) {
@@ -1411,15 +1268,11 @@ if ($Doctor) {
   }
 
   # A missing notifier is survivable — the notice file carries the result — so
-  # this is a warning, not a failure. Headless Linux legitimately has none.
+  # this is a warning, not a failure.
   $toast = Show-RescueToast "quotawake doctor" "If you can see this, notifications work."
-  Test-Doctor "desktop notification" $toast $(if ($toast) { 'sent - check your screen' } else { 'none available; CLAUDE/QUOTAWAKE-RESUMED.md is the only signal' }) -Warn:(-not $toast)
+  Test-Doctor "desktop notification" $toast $(if ($toast) { 'sent - check your screen' } else { 'none available; QUOTAWAKE-RESUMED.md is the only signal' }) -Warn:(-not $toast)
 
-  $awake = switch ($script:Platform) {
-    'Windows' { 'SetThreadExecutionState (built in)' }
-    'Linux'   { if (Get-Command systemd-inhibit -ErrorAction SilentlyContinue) { 'systemd-inhibit' } else { $null } }
-  }
-  Test-Doctor "keep-awake mechanism" ([bool]$awake) $(if ($awake) { $awake } else { 'missing - machine may sleep through a reset' }) -Warn:(-not $awake)
+  Test-Doctor "keep-awake mechanism" $true 'SetThreadExecutionState (built in)'
 
   Test-Doctor "reconciler installed" (Test-ScheduledJob $LogonTaskName) $LogonTaskName
   $autostart = Get-WatcherAutostartPath
@@ -1454,11 +1307,7 @@ if ($Install) {
   $pathChanged = Set-UserPathEntry
   Set-AliasShortcut
   Set-WatcherAutostart
-  $backendName = switch ($script:Platform) {
-    'Windows' { "scheduled task '$LogonTaskName'" }
-    'Linux'   { "systemd --user timer '$(Get-SystemdUnitName $LogonTaskName).timer'" }
-    default   { "reconciler '$LogonTaskName'" }
-  }
+  $backendName = "scheduled task '$LogonTaskName'"
   Write-Host "quotawake installed from: $ScriptDir   ($($script:Platform))"
   foreach ($c in $cleaned) { Write-Host "  migrated           $c" }
   Write-Host "  reconciler         $backendName (every 15 min)"
@@ -1474,10 +1323,7 @@ if ($Install) {
   Write-Host ""
   Write-Host "If you just moved the folder, end any watcher still running from the old"
   Write-Host "path first. To start the new one without waiting for a logon:"
-  switch ($script:Platform) {
-    'Windows' { Write-Host ("  wscript `"{0}`"" -f (Get-WatcherAutostartPath)) }
-    'Linux'   { Write-Host "  systemctl --user restart $WatcherUnit.service" }
-  }
+  Write-Host ("  wscript `"{0}`"" -f (Get-WatcherAutostartPath))
   exit 0
 }
 
