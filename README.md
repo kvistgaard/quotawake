@@ -5,13 +5,10 @@
 
 **Claude Code stops when you hit a usage limit. Quotawake starts the work again when the limit is reset – when you are asleep, away from your computer, or there but busy with something else.**
 
-Quatawake reads the reset time out of Claude's own
-message, sets an alarm, and exits. Between the limit and the reset there is no
-process at all – no CPU, no memory use. Your operating system's
+Quatawake reads the reset time out of Claude's own message, sets an alarm, and exits. Between the limit and the reset there is no process at all – no CPU, no memory use. Your operating system's
 scheduler does the waiting so a resume survives closing the window it started in, computer sleep or reboot.
 
-**Windows only.** Ports to macOS and Linux would be very welcome — earlier
-attempts at both are in the git history and are a real head start.
+**Windows only.** Ports to macOS and Linux would be very welcome.
 
 ## What happens
 
