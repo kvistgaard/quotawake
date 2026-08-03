@@ -3,11 +3,7 @@
 Thanks for looking. quotawake is small, and issues and pull requests are both
 welcome.
 
-One thing shapes everything below: **this tool's defects do not announce
-themselves.** A broken resume and a working one look identical from outside,
-because the window that hit the limit can never update itself. It once spent
-weeks appearing installed while doing nothing. Most of the rules here exist to
-make failure loud.
+This tool's defects do not announce themselves. A broken resume and a working one look identical from outside, because the window that hit the limit can never update itself. 
 
 ## Reporting a bug
 
@@ -35,17 +31,6 @@ redact anything private.
 5. Open a pull request saying **which failure the change prevents**, not just
    what it does.
 
-## Two rules that are not negotiable
-
-- **If it can fail silently, it needs a check.** Anything unit tests cannot
-  reach must be provable by `-Doctor`, which registers a real scheduled job,
-  confirms the system can see it, and removes it again.
-- **Do not add a platform you cannot test.** Windows only today. macOS
-  (`launchd`) and Linux (`systemd --user`) backends were both written and both
-  removed, because neither could be exercised on the machine shipping them and a
-  scheduler backend fails by registering *nothing*. Both are in the git history
-  and are a real head start if you have the hardware — a port is very welcome,
-  provided `-Doctor` can prove it where it runs.
 
 ## Licence
 
