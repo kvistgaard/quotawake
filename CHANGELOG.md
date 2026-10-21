@@ -2,9 +2,14 @@
 
 All notable changes to quotawake are recorded here.
 
-The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
+The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+
+## [0.1.0] – 2026-10-21
+
+First release.
 
 ### Added
 
@@ -31,3 +36,6 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Removed
 
 - The nudge to an open window
+
+[Unreleased]: https://github.com/kvistgaard/quotawake/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/kvistgaard/quotawake/releases/tag/v0.1.0
