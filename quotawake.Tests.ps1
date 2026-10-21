@@ -174,24 +174,52 @@ Check "tool work after reset still wins under deep noise" ($null -eq (Find-Stran
 $doc = @($userLine, $limitLine) + (1..200 | ForEach-Object { $metaLine }) + @($beforeReset, $afterChat)
 Check "chat-only under deep noise -> still stranded"      ($null -ne (Find-StrandedSession (NewFixture $doc)))
 
+Write-Host "== who typed: a person, or Claude Code itself =="
+# Only a person typing after the reset hands a window back to its user. Claude
+# Code writes many user lines by itself, and none of them may count.
+Check "a typed prompt is a person"                 (Test-HumanPrompt ([pscustomobject]@{ type = 'user'; message = @{ content = 'continue with the plan' } }))
+Check "a typed text block is a person"             (Test-HumanPrompt ([pscustomobject]@{ type = 'user'; message = @{ content = @(@{ type = 'text'; text = 'go on' }) } }))
+Check "a tool result is not"                       (-not (Test-HumanPrompt ([pscustomobject]@{ type = 'user'; message = @{ content = @(@{ type = 'tool_result'; content = 'x' }) } })))
+Check "a task notification is not"                 (-not (Test-HumanPrompt ([pscustomobject]@{ type = 'user'; message = @{ content = '<task-notification><task-id>b2x</task-id>' } })))
+Check "a meta line is not"                         (-not (Test-HumanPrompt ([pscustomobject]@{ type = 'user'; isMeta = $true; message = @{ content = 'Caveat' } })))
+Check "quotawake's own continue prompt is not"     (-not (Test-HumanPrompt ([pscustomobject]@{ type = 'user'; message = @{ content = $SessionResumeTask } })))
+$typedAfter = '{"type":"user","timestamp":"2026-07-18T20:30:00.000Z","message":{"role":"user","content":"keep going"},"sessionId":"aaaa-1111","cwd":"C:\\proj"}'
+$hit = Find-StrandedSession (NewFixture @($userLine, $limitLine, $typedAfter))
+Check "typing after the reset is recorded"         ($null -ne $hit -and $hit.HumanAfterReset)
+$hit = Find-StrandedSession (NewFixture @($userLine, $limitLine, $beforeReset))
+Check "typing before the reset is not"             ($null -ne $hit -and -not $hit.HumanAfterReset)
+
+Write-Host "== a copy is recognised by its id =="
+# Since Claude Code 2.1.257 `--resume <id> --bg` keeps the session's id; a new
+# id means it copied the session because something still holds it.
+Check "same id -> the session itself"              (-not (Test-CopyDispatch '1c886230-a8f4-49af-b46b-ec4c118a06c4' '1c886230'))
+Check "a different id -> a copy"                   (Test-CopyDispatch '8eed15d7-2e3b-429b-9f40-774af154614d' '1c886230')
+Check "no id printed -> not called a copy"         (-not (Test-CopyDispatch '8eed15d7-2e3b' ''))
+
 Write-Host "== rescue notice (the only signal a frozen terminal ever gets) =="
-$fakeHit = @{ SessionId = "zzzz-0000"; Cwd = $tmp; LimitTs = "2026-07-18T16:06:14.641Z"
+$fakeHit = @{ SessionId = "zzzz0000-1111"; Cwd = $tmp; LimitTs = "2026-07-18T16:06:14.641Z"
               LimitText = "resets 9:50pm"; Transcript = "x" }
-$p1 = Write-RescueNotice $fakeHit "line one`nline two" ([datetime]"2026-07-18 21:50") "finished cleanly" $false
+$p1 = Write-RescueNotice $fakeHit "line one`nline two" ([datetime]"2026-07-18 21:50") "The session is continuing in the background." $false
 Check "notice file created in the project folder" ($null -ne $p1 -and (Test-Path $p1))
 $t1 = Get-Content $p1 -Raw
-Check "notice explains why the window is dead"    ($t1 -match 'cannot be revived')
+Check "notice leads with what happened"           ($t1 -match '(?s)## Resumed automatically[^\n]*\n\nThe session is continuing')
+Check "notice says there is nothing to do"        ($t1 -match 'Nothing to do')
+Check "notice gives the one command to open it"   ($t1 -match 'qw -Open' -and $t1 -match 'claude attach zzzz0000')
+Check "notice says it is the same session"        ($t1 -match 'the same session as before')
+Check "notice no longer claims two ids differ"    ($t1 -notmatch 'ids below differ')
 Check "notice carries the run's own output"       ($t1 -like "*line two*")
-Check "notice tells you not to re-run it"         ($t1 -match 'do not re-run it by hand')
-Check "notice shows how to reopen the session"    ($t1 -match 'claude --resume zzzz-0000')
 Check "notice flags a missing toast"              ($t1 -match 'only signal')
-$p2 = Write-RescueNotice $fakeHit "second run" ([datetime]"2026-07-18 21:50") "finished cleanly" $true
+$p2 = Write-RescueNotice $fakeHit "second run" ([datetime]"2026-07-18 21:50") "Done." $true
 $t2 = Get-Content $p2 -Raw
 Check "a second rescue appends, never overwrites" (([regex]::Matches($t2, 'Resumed automatically')).Count -eq 2)
 Check "notice records that a toast was shown"     ($t2 -match 'Desktop notification \| shown')
+Remove-Item $p1 -Force -ErrorAction SilentlyContinue
+$p3 = Write-RescueNotice $fakeHit "" $null "quotawake could not resume this session (exit 1)." $false $false
+Check "a failed resume says how to do it by hand" ((Get-Content $p3 -Raw) -match 'claude --resume zzzz0000-1111')
+Remove-Item $p3 -Force -ErrorAction SilentlyContinue
 Check "unreachable project folder -> no notice"   ($null -eq (Write-RescueNotice `
   @{ SessionId = "q"; Cwd = (Join-Path $tmp "no-such-dir"); LimitTs = "x" } "t" $null "r" $false))
-Remove-Item $p1 -Force -ErrorAction SilentlyContinue
+Check "an empty project path -> no notice, no throw" ($null -eq (Write-RescueNotice @{ SessionId = "q"; Cwd = ''; LimitTs = "x" } "t" $null "r" $false))
 # The toast is best-effort by design: a rescue that already succeeded must not
 # be reported as failed just because no notifier is reachable.
 if (-not (Get-Module -ListAvailable -Name BurntToast -ErrorAction SilentlyContinue)) {
@@ -215,20 +243,34 @@ $script:ProcessedSessionsFile = Join-Path $tmp "resumed-sessions.json"
 $script:sessArmed = @(); $script:resumed = @(); $script:fakeTask = $null
 function Register-SessionsFireTask([datetime]$fireAt) { $script:sessArmed += $fireAt }
 function Get-ScheduledTask { param($TaskName, $ErrorAction) return $script:fakeTask }
-# Mirrors the real --bg return shape: the dispatch exits 0 immediately and hands
-# back the background agent's id, which is what the Claude app (and the phone)
-# lists. A -p run returned none of this and was invisible everywhere.
+# Mirrors the real --bg return shape: the dispatch exits 0 at once and prints
+# the session's 8-character id – its own id, since resumes keep it. A test
+# that sets $script:copyNext stands for a CLI that copied the session instead.
+$script:copyNext = $false
 function Invoke-SessionResume($hit) {
   $script:resumed += $hit.SessionId
-  return @{ Text = "backgrounded `u{00B7} abcd1234"; Code = 0; BgId = "abcd1234"; State = "done"; Summary = "the work is finished" }
+  if ($script:copyNext) { return @{ Text = "note: started a copy as c0c0c0c0"; Code = 0; BgId = "c0c0c0c0"; State = 'removed'; Summary = ''; Copy = $true } }
+  $bg = $hit.SessionId.Substring(0, [math]::Min(8, $hit.SessionId.Length))
+  return @{ Text = "backgrounded `u{00B7} $bg"; Code = 0; BgId = $bg; State = "done"; Summary = "the work is finished"; Copy = $false }
 }
 $script:toasts = @()
 function Show-RescueToast([string]$title, [string]$body) { $script:toasts += $body; return $false }
+# Ending a holder means killing a process or stopping a session: mocked, so no
+# test touches anything running on this machine.
+$script:stopped = @(); $script:stopWorks = $true
+function Stop-SessionHolder($info) { $script:stopped += $info; return $script:stopWorks }
 # Nothing here may shell out to the real `claude agents`: it would be slow, and
 # it would make the suite's verdict depend on whatever the machine happens to be
 # running. Individual cases below override this to describe a live session.
 $script:agents = @()
-function Get-AgentList { return $script:agents }
+# $script:agents = $null stands for a probe that could not be taken at all,
+# which the real function reports the same way. The rest goes back as an array
+# even when empty – `return @()` unrolls to $null and would make every case
+# below look like a failed probe.
+function Get-AgentList {
+  if ($null -eq $script:agents) { return $null }
+  return ,@($script:agents)
+}
 
 function NewLimitLine([string]$sid, [datetime]$ts, [string]$resetText, [string]$cwd) {
   ([ordered]@{
@@ -239,9 +281,13 @@ function NewLimitLine([string]$sid, [datetime]$ts, [string]$resetText, [string]$
   } | ConvertTo-Json -Depth 8 -Compress)
 }
 $tr = Join-Path $projDir "sess.jsonl"
-function WriteStop([datetime]$ts, [datetime]$reset, [string]$sid, [string]$cwd) {
-  Set-Content -Path $tr -Encoding UTF8 -Value (@($userLine,
-    (NewLimitLine $sid $ts ("You've hit your session limit - resets " + $reset.ToString("h:mmtt").ToLower()) $cwd)) -join "`n")
+function WriteStop([datetime]$ts, [datetime]$reset, [string]$sid, [string]$cwd, [string[]]$after = @()) {
+  Set-Content -Path $tr -Encoding UTF8 -Value ((@($userLine,
+    (NewLimitLine $sid $ts ("You've hit your session limit - resets " + $reset.ToString("h:mmtt").ToLower()) $cwd)) + $after) -join "`n")
+  # A stranded transcript's last write is its own stop line, hours ago. Say so
+  # on disk: the dispatch checks the file's mtime to see whether a process is
+  # writing it, and a fixture created a millisecond ago reads as very much alive.
+  try { (Get-Item -LiteralPath $tr).LastWriteTime = $ts } catch {}
 }
 
 $soon = (Get-Date).AddHours(1)
@@ -253,14 +299,14 @@ Check "arming lands at reset + 5 min"            ([math]::Abs(($script:sessArmed
 Check "pending-sessions state written"           (Test-Path $script:SessionsStateFile)
 
 # The exact 2026-07-25 failure: one pass sees nothing, and used to respond by
-# unregistering the armed task — throwing away a rescue that had not fired yet.
+# unregistering the armed task – throwing away a rescue that had not fired yet.
 Rename-Item $tr ($tr + ".hidden")
 $script:sessArmed = @(); $script:fakeTask = $null
 Invoke-SessionReconcile
 Check "an empty scan does NOT delete a live arming"  (Test-Path $script:SessionsStateFile)
 Check "an empty scan re-registers a missing task"    ($script:sessArmed.Count -eq 1)
 
-Save-SessionsState ((Get-Date).AddMinutes(-5)) @() 0
+Save-SessionsState ((Get-Date).AddMinutes(-5)) @()
 Invoke-SessionReconcile
 Check "clears only once the armed time has passed"   (-not (Test-Path $script:SessionsStateFile))
 
@@ -275,20 +321,14 @@ Check "resumed session recorded as handled"              (Test-ProcessedSession 
 # The rescue is worthless if the user cannot tell it happened.
 $autoNotice = Join-Path $tmp $SessionNoticeFile
 Check "a real rescue attempts a desktop toast"           ($script:toasts.Count -eq 1)
-Check "the toast says not to re-run by hand"             ($script:toasts[0] -match 'do not re-run')
-# The whole point of --bg over -p: the resumed session must be findable from the
-# phone, so the notice has to give its id and say how to get back into it.
-$n = Get-Content (Join-Path $tmp "QUOTAWAKE-RESUMED.md") -Raw
-Check "notice gives the resumed session's id"            ($n -match 'abcd1234')
-Check "notice says it is visible in the Claude app"      ($n -match '(?i)Claude app')
-# The user must never be sent to `--resume` for the session that is running -
-# that answers "No conversation found" and reads as a broken rescue.
-Check "notice leads with the claude agents list"         ($n -match 'claude agents')
-Check "notice labels the two ids in plain words"         ($n -match 'Session that stopped' -and $n -match 'Resumed session')
-Check "notice gives the attach/logs commands"            ($n -match 'claude attach abcd1234' -and $n -match 'claude logs abcd1234')
+Check "the toast says how to look in"                    ($script:toasts[0] -match 'qw -Open')
+$n = Get-Content $autoNotice -Raw
+Check "notice names the session"                         ($n -match 'ffff-9999')
+Check "notice gives the one command to open it"          ($n -match 'qw -Open')
 Check "notice carries the resumed session's last words"  ($n -match 'the work is finished')
-Check "a real rescue leaves a notice in the project"     (Test-Path $autoNotice)
-Check "that notice names the rescued session"            ((Get-Content $autoNotice -Raw) -like "*ffff-9999*")
+# The transcript keeps the stop that was just handled: a resume keeps the id.
+# That old stop must not be reported as a new one (9 of 11 resumes did).
+Check "the handled stop is not reported as a new limit"  ($n -notmatch 'another usage limit')
 Remove-Item $autoNotice -Force -ErrorAction SilentlyContinue
 
 # A project on an unmounted Google Drive must be retried, never written off.
@@ -299,6 +339,15 @@ Invoke-SessionReconcile
 Check "unreachable project folder -> not resumed"        ($script:resumed.Count -eq 0)
 Check "unreachable project folder -> NOT written off"    (-not (Test-ProcessedSession (Get-ProcessedSessions) "gggg-8888" (ConvertTo-IsoUtcString $past)))
 Check "unreachable project folder -> retry re-armed"     ($script:sessArmed.Count -eq 1)
+# Retried for as long as it takes, but not forever: a day after its reset the
+# stop is written off, with a note. Measured per session from its own reset.
+$old = (Get-Date).AddHours(-30)
+WriteStop $old $old.AddMinutes(30) "gggg-8888" (Join-Path $tmp "no-such-drive")
+Remove-Item $script:ProcessedSessionsFile, $script:SessionsStateFile -Force -ErrorAction SilentlyContinue
+$script:resumed = @(); $script:sessArmed = @(); $script:toasts = @()
+Invoke-SessionReconcile
+Check "a day past its reset it is given up"              (Test-ProcessedSession (Get-ProcessedSessions) "gggg-8888" (ConvertTo-IsoUtcString $old))
+Check "giving up is announced"                           ($script:toasts.Count -eq 1 -and $script:toasts[0] -match 'gave up')
 
 # An 8-character hex id tells the user nothing about which session it is. The
 # name is the only thing in `claude agents` that can, and Claude Code derives it
@@ -311,54 +360,131 @@ Check "session label says when it was resumed"           ($lbl -match 'resumed \
 Check "session label survives a pathless hit"            ((Get-SessionLabel ([pscustomobject]@{ Cwd = '' })) -match 'unknown project')
 
 # The ledger doubles as the map the user opens to answer "which id is mine?".
-# Two UUIDs and a timestamp cannot answer that; project and resumed-id can.
 Remove-Item $script:ProcessedSessionsFile -Force -ErrorAction SilentlyContinue
-Add-ProcessedSession "old-1111" "2026-08-02T10:00:00Z" "C:\_GitHub\my-project" "7f3ab210" "my-project — resumed 20:04"
+Add-ProcessedSession "7f3ab210-1111" "2026-08-02T10:00:00Z" "C:\_GitHub\my-project" "7f3ab210" "my-project – resumed 20:04"
 $led = @(Get-ProcessedSessions)
 Check "ledger row records the project"                   ($led[0].project -eq 'my-project')
 Check "ledger row records the resumed session id"        ($led[0].resumedAs -eq '7f3ab210')
 Check "ledger row records the full project path"         ($led[0].projectPath -eq 'C:\_GitHub\my-project')
 # Duplicate suppression must keep working across the added fields, or a resumed
 # session gets resumed a second time.
-Check "ledger still suppresses a handled pair"           (Test-ProcessedSession $led "old-1111" (ConvertTo-IsoUtcString "2026-08-02T10:00:00Z"))
+Check "ledger still suppresses a handled pair"           (Test-ProcessedSession $led "7f3ab210-1111" (ConvertTo-IsoUtcString "2026-08-02T10:00:00Z"))
 Remove-Item $script:ProcessedSessionsFile -Force -ErrorAction SilentlyContinue
 
-# A stop line records that a session HIT a limit. It does not record that the
-# session is gone — and a session that is still running must never be resumed,
-# because `--resume --bg` forks it rather than continuing it. Missing this turned
-# one live interactive window into a three-deep chain of background agents in
-# half an hour on 2026-08-01: the tool rescued the user's own terminal, then
-# rescued its own rescue, twice.
-function ScanOnly([string]$sid, $agents) {
+# `qw -Open` picks the session for the folder it is run in.
+$rowsOpen = @(
+  [pscustomobject]@{ resumedAs = 'a1b2c3d4'; projectPath = 'C:\_GitHub\another-project' },
+  [pscustomobject]@{ resumedAs = '7f3ab210'; projectPath = 'C:\_GitHub\my-project' },
+  [pscustomobject]@{ resumedAs = '';         projectPath = 'C:\_GitHub\my-project' },
+  [pscustomobject]@{ resumedAs = 'e5f6a7b8'; projectPath = 'C:\_GitHub\third-project' })
+Check "-Open picks this folder's resume"                 ((Select-ResumedRow $rowsOpen 'C:\_GitHub\my-project').resumedAs -eq '7f3ab210')
+Check "-Open works from a subfolder"                     ((Select-ResumedRow $rowsOpen 'C:\_GitHub\my-project\src').resumedAs -eq '7f3ab210')
+Check "-Open does not match a name prefix"               ((Select-ResumedRow $rowsOpen 'C:\_GitHub\my-project-two').resumedAs -eq 'e5f6a7b8')
+Check "-Open elsewhere -> the newest resume"             ((Select-ResumedRow $rowsOpen 'C:\Users').resumedAs -eq 'e5f6a7b8')
+Check "-Open with no resumes -> nothing"                 ($null -eq (Select-ResumedRow @() 'C:\'))
+
+# A stop line records that a session HIT a limit, not that it is gone. A held
+# session is never resumed outright: `--resume --bg` would copy it, and the copy
+# works beside the holder. That is what happened on 2026-09-28: a copy did the
+# night's work and the open window started the same work again at 08:19.
+function ScanOnly([string]$sid, $agents, [switch]$KeepLedger, [string[]]$after = @()) {
   $script:agents = $agents
-  WriteStop $past $past.AddMinutes(30) $sid $tmp
-  Remove-Item $script:ProcessedSessionsFile, $script:SessionsStateFile -Force -ErrorAction SilentlyContinue
-  $script:resumed = @(); $script:sessArmed = @()
+  WriteStop $past $past.AddMinutes(30) $sid $tmp $after
+  if (-not $KeepLedger) { Remove-Item $script:ProcessedSessionsFile -Force -ErrorAction SilentlyContinue }
+  Remove-Item $script:SessionsStateFile -Force -ErrorAction SilentlyContinue
+  $script:resumed = @(); $script:stopped = @(); $script:sessArmed = @(); $script:toasts = @()
   Invoke-SessionReconcile
-  Remove-Item (Join-Path $tmp $SessionNoticeFile) -Force -ErrorAction SilentlyContinue
 }
 
-# The user's own open window. Its TUI continues by itself after a reset.
-ScanOnly "live-0001" @([pscustomobject]@{ sessionId = "live-0001"; pid = 4242; kind = "interactive"; status = "idle" })
-Check "a live interactive session is never rescued"      ($script:resumed.Count -eq 0)
-Check "a live session is NOT written off as handled"     (-not (Test-ProcessedSession (Get-ProcessedSessions) "live-0001" (ConvertTo-IsoUtcString $past)))
+# The user's own open window, 90 minutes past its reset and still stopped.
+$liveWindow = @([pscustomobject]@{ sessionId = "live-0001"; pid = 4242; kind = "interactive"; status = "idle" })
+ScanOnly "live-0001" $liveWindow
+Check "a stopped open window is taken over"              ($script:stopped.Count -eq 1 -and $script:stopped[0].Pid -eq 4242)
+Check "its holder is ended BEFORE the session resumes"   ($script:resumed -contains "live-0001")
+Check "the take-over closes the pair"                    (Test-ProcessedSession (Get-ProcessedSessions) "live-0001" (ConvertTo-IsoUtcString $past))
+$cn = Get-Content (Join-Path $tmp $SessionNoticeFile) -Raw
+Check "the notice says the window was closed"            ($cn -match 'quotawake closed it')
+Check "the notice says nothing runs twice"               ($cn -match 'Nothing runs twice')
+Remove-Item (Join-Path $tmp $SessionNoticeFile) -Force -ErrorAction SilentlyContinue
 
-# An agent waiting on a permission prompt needs a human, not a second copy.
-ScanOnly "blkd-0002" @([pscustomobject]@{ sessionId = "blkd-0002"; id = "blkd"; kind = "background"; state = "blocked"; status = "waiting" })
-Check "an agent blocked on a prompt is left alone"       ($script:resumed.Count -eq 0)
+# A holder that cannot be ended is never resumed past: the resume would copy.
+$script:stopWorks = $false
+ScanOnly "live-0001" $liveWindow
+Check "a holder that will not end -> no resume"          ($script:resumed.Count -eq 0)
+Check "... and the session stays eligible"               (-not (Test-ProcessedSession (Get-ProcessedSessions) "live-0001" (ConvertTo-IsoUtcString $past)))
+Check "... and a retry is armed"                         ($script:sessArmed.Count -eq 1)
+$script:stopWorks = $true
 
-# A previously dispatched rescue, still running: resuming it is what chained.
-ScanOnly "bgrn-0003" @([pscustomobject]@{ sessionId = "bgrn-0003"; id = "bgrn"; kind = "background"; state = "running" })
-Check "a running background agent is not re-rescued"     ($script:resumed.Count -eq 0)
+# Someone typed into the window after the reset: they are there. Hands off.
+$typedNow = '{"type":"user","timestamp":"' + (Get-Date).AddMinutes(-20).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffZ") + '","message":{"role":"user","content":"what happened?"},"sessionId":"live-0001","cwd":"C:\\proj"}'
+ScanOnly "live-0001" $liveWindow -after @($typedNow)
+Check "typed after the reset -> not taken over"          ($script:stopped.Count -eq 0 -and $script:resumed.Count -eq 0)
+Check "typed after the reset -> left to the user"        (Test-ProcessedSession (Get-ProcessedSessions) "live-0001" (ConvertTo-IsoUtcString $past))
+Check "the note says it was left to them"                ((Get-Content (Join-Path $tmp $SessionNoticeFile) -Raw) -match 'Left to you')
+Remove-Item (Join-Path $tmp $SessionNoticeFile) -Force -ErrorAction SilentlyContinue
 
-# But a finished agent holds no process, so it stays eligible.
+# The decision itself, without the pass around it.
+$fakeLive = @{ SessionId = 'live-0001'; LimitTs = (ConvertTo-IsoUtcString $past); LimitText = "resets " + $past.AddMinutes(30).ToString("h:mmtt").ToLower(); Cwd = $tmp }
+$justReset = $past.AddMinutes(30).AddSeconds(60)
+$win = @{ Kind = 'interactive'; Pid = 4242; Status = 'idle'; Id = '' }
+Check "inside the grace -> defer (it may continue itself)"  ((Resolve-LiveStrandedAction $fakeLive $win $justReset).Action -eq 'defer')
+Check "the grace defer asks for a look when it ends"        ($null -ne (Resolve-LiveStrandedAction $fakeLive $win $justReset).RetryAt)
+Check "past the grace -> take over"                         ((Resolve-LiveStrandedAction $fakeLive $win $justReset.AddSeconds($SessionLiveGraceSeconds)).Action -eq 'takeover')
+$busy = @{ Kind = 'interactive'; Pid = 4242; Status = 'busy'; Id = '' }
+Check "busy, inside the busy grace -> defer"                ((Resolve-LiveStrandedAction $fakeLive $busy $justReset.AddSeconds($SessionLiveGraceSeconds)).Action -eq 'defer')
+Check "busy past the busy grace -> take over anyway"        ((Resolve-LiveStrandedAction $fakeLive $busy $justReset.AddSeconds($SessionBusyGraceSeconds)).Action -eq 'takeover')
+Check "an unknown kind of holder is never ended"            ((Resolve-LiveStrandedAction $fakeLive @{ Kind = 'unknown'; Pid = 1; Status = '' } (Get-Date)).Action -eq 'defer')
+$fakeTyped = $fakeLive.Clone(); $fakeTyped.HumanAfterReset = $true
+Check "typed after the reset -> leave"                      ((Resolve-LiveStrandedAction $fakeTyped $win (Get-Date)).Action -eq 'leave')
+$isoX = ConvertTo-IsoUtcString '2026-01-01T00:00:00Z'
+Check "a resume row closes the pair"                     (Test-ProcessedSession @([pscustomobject]@{ sessionId = 'x'; limitTs = $isoX; action = 'resumed' }) 'x' $isoX)
+Check "a row from before the action field counts as a resume" (Test-ProcessedSession @([pscustomobject]@{ sessionId = 'x'; limitTs = $isoX }) 'x' $isoX)
+Check "an old nudge row does not close the pair"         (-not (Test-ProcessedSession @([pscustomobject]@{ sessionId = 'x'; limitTs = $isoX; action = 'nudged' }) 'x' $isoX))
+Check "a removed copy is never rescued, by its id prefix" (Test-ProcessedSession @([pscustomobject]@{ sessionId = 'c0c0c0c0'; limitTs = $isoX; action = 'discarded copy' }) 'c0c0c0c0-9999-aaaa' (ConvertTo-IsoUtcString '2026-02-02T00:00:00Z'))
+
+# A background session stopped at a new limit – this tool's own rescue, say –
+# is stopped through the CLI and continued under the same id. No copy, so no
+# chain: the ids never multiply (the 2026-08-01 chain came from copies).
+ScanOnly "bgrn-0003" @([pscustomobject]@{ sessionId = "bgrn-0003"; id = "bgrn0003"; kind = "background"; state = "blocked" })
+Check "a stopped background session is taken over"      ($script:stopped.Count -eq 1 -and $script:stopped[0].Id -eq 'bgrn0003')
+Check "... and continued under its own id"              ($script:resumed -contains "bgrn-0003")
+Remove-Item (Join-Path $tmp $SessionNoticeFile) -Force -ErrorAction SilentlyContinue
+
+# A finished agent holds no process, so it is resumed without any take-over.
 ScanOnly "done-0004" @([pscustomobject]@{ sessionId = "done-0004"; id = "done"; kind = "background"; state = "done" })
-Check "a finished agent is still a valid target"         ($script:resumed -contains "done-0004")
+Check "a finished agent is resumed directly"             ($script:resumed -contains "done-0004" -and $script:stopped.Count -eq 0)
 
-# Losing the agent list must not disable rescue altogether.
+# An empty list is an answer: the CLI ran and nothing holds the session.
 ScanOnly "gone-0005" @()
-Check "an unreadable agent list still allows rescue"     ($script:resumed -contains "gone-0005")
+Check "an empty agent list still allows rescue"          ($script:resumed -contains "gone-0005")
+
+# A probe that could not be taken used to defer every resume (all seven on
+# 2026-09-13). It resumes now: if anything still holds the session, the CLI
+# copies it instead, says so by the id it prints, and the copy is removed.
+ScanOnly "blnd-0006" $null
+Check "a blind agent probe still resumes"                ($script:resumed -contains "blnd-0006")
+$script:copyNext = $true
+ScanOnly "blnd-0006" $null
+$script:copyNext = $false
+Check "a copy is not counted as a resume"                (-not (Test-ProcessedSession (Get-ProcessedSessions) "blnd-0006" (ConvertTo-IsoUtcString $past)))
+Check "the removed copy is recorded so it is never rescued" (Test-ProcessedSession (Get-ProcessedSessions) "c0c0c0c0-0000-0000" (ConvertTo-IsoUtcString $past))
+Check "a copy defers the session for another look"       ($script:sessArmed.Count -eq 1)
+Check "a removed copy raises no 'resumed' toast"         ($script:toasts.Count -eq 0)
 $script:agents = @()
+
+# The transcript itself answers the same question without the CLI: a file being
+# written right now has a process on it, whoever that is.
+WriteStop $past $past.AddMinutes(30) "warm-0007" $tmp
+(Get-Item -LiteralPath $tr).LastWriteTime = (Get-Date)
+Remove-Item $script:ProcessedSessionsFile, $script:SessionsStateFile -Force -ErrorAction SilentlyContinue
+$script:resumed = @(); $script:sessArmed = @()
+Invoke-SessionReconcile
+Check "a transcript written just now is not resumed"     ($script:resumed.Count -eq 0)
+Check "a warm transcript leaves the session eligible"    (-not (Test-ProcessedSession (Get-ProcessedSessions) "warm-0007" (ConvertTo-IsoUtcString $past)))
+# Deferrals no longer spend a shared budget. Many passes in a row write nothing off.
+for ($i = 0; $i -lt 10; $i++) { (Get-Item -LiteralPath $tr).LastWriteTime = (Get-Date); Invoke-SessionReconcile }
+Check "ten deferrals in a row write nothing off"         (-not (Test-ProcessedSession (Get-ProcessedSessions) "warm-0007" (ConvertTo-IsoUtcString $past)))
+Remove-Item (Join-Path $tmp $SessionNoticeFile) -Force -ErrorAction SilentlyContinue
 
 Write-Host "== platform =="
 # Windows only. Backends for macOS (launchd) and Linux (systemd --user) were both

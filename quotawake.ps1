@@ -26,18 +26,23 @@
   Interactive TUI sessions never pass through this wrapper, but their limit
   stops are recorded in the transcript (~/.claude/projects/<dir>/<id>.jsonl) as
   a line with top-level "error":"rate_limit" whose text carries the reset time.
-  An open TUI on an awake machine auto-continues ~3 min after the reset — but a
-  closed or abandoned session stays dead forever. So every -Reconcile pass also
-  scans recent transcripts for sessions *stranded* on a rate-limit stop, arms a
-  one-shot task (QuotaWake-FireSessions) for reset+buffer, and then resumes
-  each stranded conversation headlessly: `claude --resume <sessionId> -p ...`
-  run in the session's own project folder. State: pending-sessions.json (also
-  watched by keep-awake.ps1); handled stops: resumed-sessions.json.
+  Claude Code continues an open window by itself after the reset ("Continue
+  automatically at usage limit") – not always – and a closed session stays
+  dead forever. So every -Reconcile pass also scans recent transcripts for
+  sessions *stranded* on a rate-limit stop, arms a one-shot task
+  (QuotaWake-FireSessions) for reset+buffer, and then acts on each: a closed
+  session is continued in the background under its own id (`claude --resume
+  <sessionId> --bg ...` in its own project folder); a session still held by a
+  process and still stopped past a grace is taken over – the holder is ended
+  first, then the session is continued the same way – unless someone typed
+  into it after the reset. One process on a session, ever. State:
+  pending-sessions.json (also watched by keep-awake.ps1); handled stops:
+  resumed-sessions.json.
 
 .NOTES
-  - Headless only (`claude -p`); it cannot type into a live interactive TUI.
-    (Session rescue forks a stranded conversation into a new headless run; the
-    TUI window that hit the limit stays as it was.)
+  - Nothing outside Claude Code can type into a live interactive TUI, which is
+    why a stopped window is ended and its session continued in the background
+    rather than copied beside it.
   - For unattended edits pass -PermissionMode acceptEdits, or set an allowlist
     in .claude/settings.json; headless claude cannot approve its own actions.
   - Exit codes: 0 done · 2 bad -At · 4 hit MaxRounds · 5 resume armed ·
@@ -111,6 +116,10 @@ param(
   # user needs after a rescue: which project, which session, still running?
   [switch]$List,
 
+  # Open the session quotawake resumed for the current folder (or, outside any
+  # such folder, the most recent one) in this terminal. Nothing to look up.
+  [switch]$Open,
+
   # Define the functions and return without running — for the test harness.
   [switch]$SelfTest
 )
@@ -135,9 +144,28 @@ $script:SessionsStateFile     = Join-Path $ScriptDir "pending-sessions.json"
 $script:ProcessedSessionsFile = Join-Path $ScriptDir "resumed-sessions.json"
 $script:RescueLockFile        = Join-Path $ScriptDir ".session-rescue.lock"
 $script:ProjectsRoot          = Join-Path $env:USERPROFILE ".claude\projects"
-$SessionScanWindowHours = 48    # only transcripts touched this recently are scanned
-$SessionBufferSeconds   = 300   # an open TUI auto-continues ~3 min after reset; it must win
-$SessionMaxAttempts     = 8     # re-arm cap while the window stays shut
+$SessionScanWindowHours  = 48   # only transcripts touched this recently are scanned
+$SessionBufferSeconds    = 300  # an open TUI auto-continues ~3 min after reset; it must win
+$SessionLiveWriteSeconds = 300  # a transcript written this recently still has a process on it
+# A stop is written off only this long after its own reset. Measured per
+# session from a fixed instant, never by counting passes: a pass count used to
+# be shared by the whole batch and spent by harmless deferrals ("still live",
+# "transcript warm"), so one blocked session could write off every other one
+# within two hours (2026-09-28).
+$SessionGiveUpHours      = 24
+# A session still held by a process gets this long past its reset to continue
+# by itself (Claude Code's own "Continue automatically at usage limit"). After
+# that quotawake takes it over: it ends the holding process and continues the
+# same session in the background, so one process is ever on the work.
+$SessionLiveGraceSeconds = 600
+# A holder that says it is busy gets longer, in case it is mid-turn. Not
+# forever: a window idle at a limit has been seen reporting itself busy.
+$SessionBusyGraceSeconds = 1800
+# The oldest Claude Code whose `--resume <id> --bg` continues the same session
+# (2.1.257) and whose `--resume` opens a running background session instead of
+# refusing it (2.1.285). Older versions fork a copy, which is the parallel work
+# this tool exists to prevent. Checked by -Doctor.
+$MinClaudeVersion = [version]'2.1.285'
 $SessionResumeTask      = "You were interrupted by a usage-limit reset. Continue the pending work from where it left off. If it was already complete, reply DONE."
 $SessionPermissionMode  = "acceptEdits"
 # Dropped in the rescued project's OWN folder, not next to this script: the
@@ -403,6 +431,28 @@ function ConvertTo-LocalDateTime($v) {
   } catch { return $null }
 }
 
+function Test-HumanPrompt($ev) {
+  # A user line a person typed, as opposed to the many user lines Claude Code
+  # writes by itself: tool results, task notifications and command echoes
+  # (which arrive wrapped in <tags>), meta lines, and quotawake's own continue
+  # prompt.
+  if ($ev.isMeta) { return $false }
+  $c = $ev.message.content
+  $texts = @()
+  if ($c -is [string]) { $texts = @($c) }
+  else {
+    foreach ($b in @($c)) {
+      if ($b.type -eq 'tool_result') { return $false }
+      if ($b.type -eq 'text') { $texts += [string]$b.text }
+    }
+  }
+  foreach ($t in $texts) {
+    $t = $t.Trim()
+    if ($t -and -not $t.StartsWith('<') -and $t -ne $SessionResumeTask) { return $true }
+  }
+  return $false
+}
+
 function Find-StrandedSession([string]$jsonlPath) {
   # Returns @{SessionId;Cwd;LimitTs;LimitText;Transcript} if the transcript's
   # last real event is a rate-limit stop; $null if it completed or moved on.
@@ -487,13 +537,22 @@ function Find-StrandedSession([string]$jsonlPath) {
     $reset = Parse-ResetTime $hit.LimitText $anchor
     if ($null -eq $reset) { return $hit }   # unreadable reset: assume stranded
 
+    # Typing after the reset means someone is at the window and has chosen what
+    # to do with it, so it is not taken over. Typing before the reset does not
+    # count: that is the 2026-07-31 question asked while the window was shut,
+    # after which its user walked away.
+    $hit.HumanAfterReset = $false
     for ($j = $limIdx + 1; $j -lt $lines.Count; $j++) {
-      if ($lines[$j] -notmatch '"type"\s*:\s*"assistant"') { continue }
+      if ($lines[$j] -notmatch '"type"\s*:\s*"(assistant|user)"') { continue }
       $e2 = $null
       try { $e2 = $lines[$j] | ConvertFrom-Json } catch { continue }
-      if ($e2.type -ne 'assistant' -or $e2.isApiErrorMessage) { continue }
       $ts = ConvertTo-LocalDateTime $e2.timestamp
       if ($null -eq $ts -or $ts -lt $reset) { continue }
+      if ($e2.type -eq 'user') {
+        if (Test-HumanPrompt $e2) { $hit.HumanAfterReset = $true }
+        continue
+      }
+      if ($e2.type -ne 'assistant' -or $e2.isApiErrorMessage) { continue }
       $usedTool = $false
       try { $usedTool = [bool]@($e2.message.content | Where-Object { $_.type -eq 'tool_use' }).Count } catch {}
       if ($usedTool) { return $null }       # genuinely back at work
@@ -513,12 +572,17 @@ function Get-ProcessedSessions {
   return @()
 }
 
-function Add-ProcessedSession([string]$sessionId, [string]$limitTs, [string]$cwd = '', [string]$resumedAs = '', [string]$label = '') {
+function Add-ProcessedSession([string]$sessionId, [string]$limitTs, [string]$cwd = '', [string]$resumedAs = '', [string]$label = '', [string]$action = 'resumed') {
   # This file is not only a duplicate-suppression ledger — it is the map the
   # user opens to answer "which of these ids is mine?". A row of two UUIDs and
   # a timestamp cannot answer that, so every row also carries the project it
   # belongs to, the name shown in `claude agents`, and the id of the session
   # that took over. Extra fields are optional: older rows stay readable.
+  #
+  # $action says how the pair was closed: 'resumed', 'left to you' (someone
+  # typed into the window after the reset), 'discarded copy' (a copy the CLI
+  # made despite every check, stopped at once), or 'gave up'. Rows from the
+  # retired nudge carry 'nudged' and never closed a pair. One row per pair.
   $all = @(Get-ProcessedSessions | Where-Object { -not ($_.sessionId -eq $sessionId -and $_.limitTs -eq $limitTs) })
   $row = [ordered]@{
     project      = $(if ($cwd) { try { Split-Path -Leaf $cwd } catch { '' } } else { '' })
@@ -528,6 +592,7 @@ function Add-ProcessedSession([string]$sessionId, [string]$limitTs, [string]$cwd
     projectPath  = $cwd
     limitTs      = $limitTs
     handled      = (Get-Date).ToString("o")
+    action       = $action
     # Kept under the original key as well: Test-ProcessedSession matches on it,
     # and so do the rows written before this file grew the friendlier fields.
     sessionId    = $sessionId
@@ -538,16 +603,23 @@ function Add-ProcessedSession([string]$sessionId, [string]$limitTs, [string]$cwd
 }
 
 function Test-ProcessedSession($processed, [string]$sessionId, [string]$limitTs) {
+  # A row left by the retired nudge does not close the pair; ledgers written
+  # before 2026-10-20 still hold some. Rows written before the action field
+  # existed are resumes.
   foreach ($p in $processed) {
-    if ($p.sessionId -eq $sessionId -and (ConvertTo-IsoUtcString $p.limitTs) -eq $limitTs) { return $true }
+    # A copy the CLI made and quotawake removed is recorded by its 8-character
+    # id; its transcript, under the full id, must never be rescued.
+    if ([string]$p.action -eq 'discarded copy' -and $p.sessionId -and
+        $sessionId.StartsWith([string]$p.sessionId, [StringComparison]::OrdinalIgnoreCase)) { return $true }
+    if ($p.sessionId -eq $sessionId -and (ConvertTo-IsoUtcString $p.limitTs) -eq $limitTs -and
+        [string]$p.action -ne 'nudged') { return $true }
   }
   return $false
 }
 
-function Save-SessionsState([datetime]$fireAt, $sessions, [int]$attempt) {
+function Save-SessionsState([datetime]$fireAt, $sessions) {
   $payload = @{
     fireAt   = $fireAt.ToString("o")
-    attempt  = $attempt
     saved    = (Get-Date).ToString("o")
     sessions = @($sessions | ForEach-Object {
       @{ sessionId = $_.SessionId; cwd = $_.Cwd; limitTs = $_.LimitTs; transcript = $_.Transcript }
@@ -570,34 +642,55 @@ function Clear-SessionsState {
 
 function Get-AgentList {
   # `claude agents --json --all` lists interactive AND background sessions —
-  # the same set the Claude app shows. Best-effort; never throws.
-  try {
-    $json = (& claude agents --json --all 2>$null | Out-String)
-    if ([string]::IsNullOrWhiteSpace($json)) { return @() }
-    return @($json | ConvertFrom-Json)
-  } catch { return @() }
+  # the same set the Claude app shows. Never throws.
+  #
+  # $null and @() are different answers and callers depend on the difference:
+  # $null is "the probe did not run" (no claude on PATH, a hang, output that is
+  # not JSON), @() is "the CLI answered and nothing is running". Collapsing the
+  # two makes a blind probe look like an idle machine, which is the one reading
+  # that ends in a second copy of a session that is already resuming itself.
+  #
+  # The unary comma is load-bearing: `return @()` unrolls to nothing and the
+  # caller receives $null, which would file "the CLI answered, nothing is
+  # running" under "the probe failed" and defer every rescue on an idle machine.
+  #
+  # Asked twice before giving up: a single slow start of the CLI is the usual
+  # reason the first answer comes back empty.
+  for ($try = 0; $try -lt 2; $try++) {
+    try {
+      $json = (& claude agents --json --all 2>$null | Out-String)
+      if (-not [string]::IsNullOrWhiteSpace($json)) { return ,@($json | ConvertFrom-Json) }
+    } catch {}
+  }
+  return $null
 }
 
 function Get-LiveSessionIds {
   # Session ids currently held by a running process. A stop line in a transcript
-  # says the session hit a limit; it does NOT say the session is gone. Three
-  # kinds of live session must never be rescued:
+  # says the session hit a limit; it does NOT say the session is gone, and
+  # `--resume --bg` on a held session starts a copy that works beside the
+  # holder. A held session is never resumed outright:
   #
-  #   * the user's own open terminal — Claude Code's TUI continues by itself
-  #     after a reset, so dispatching a background copy duplicates the work in a
-  #     window the user cannot see;
-  #   * a background agent this tool dispatched earlier — rescuing it forks the
-  #     rescue, and since each fork's transcript is scanned in turn the result is
-  #     a chain that spawns one agent per tick forever;
-  #   * anything merely blocked (waiting on a permission prompt) — that is a
-  #     stalled session needing a human, not a stranded one needing a resume.
+  #   * the user's own open window usually continues by itself after a reset.
+  #     Usually, not always: windows left open on 2026-09-12, 09-28 and 10-19
+  #     all sat idle. Such a window is given a grace, then taken over – ended,
+  #     then continued in the background (Resolve-LiveStrandedAction);
+  #   * a background session, including this tool's own earlier rescue, that
+  #     hit a new limit is stopped through the CLI and continued the same way.
+  #     Before resumes kept the session id, resuming a held one forked it,
+  #     and each fork's transcript was scanned in turn: on 2026-08-01 that
+  #     forked a live window three deep in half an hour.
   #
-  # On 2026-08-01 the absence of this check forked a live interactive session
-  # three deep (one live window -> its rescue -> its rescue) in half an hour.
-  # An empty result means "could not tell" and is deliberately non-blocking: the
-  # processed ledger and the fire-time buffer still bound the damage.
+  # Returns $null when the probe could not be run at all, an empty hashtable
+  # when it ran and found nothing live. The dispatch does not depend on the
+  # difference any more: `--resume --bg` itself reports a copy when something
+  # holds the session, and Invoke-SessionResume discards that copy at once
+  # (Test-CopyDispatch). The probe decides who to take over; the CLI's own
+  # answer is the guard.
+  $agents = Get-AgentList
+  if ($null -eq $agents) { return $null }
   $live = @{}
-  foreach ($a in (Get-AgentList)) {
+  foreach ($a in $agents) {
     $sid = [string]$a.sessionId
     if (-not $sid) { continue }
     # A pid is the strongest signal: something is attached to it right now.
@@ -605,7 +698,18 @@ function Get-LiveSessionIds {
     # Terminal states are the only ones safe to treat as finished.
     $state = ([string]$a.state).ToLowerInvariant()
     if ($state -and $state -notin @('done', 'failed', 'stopped', 'killed')) { $alive = $true }
-    if ($alive) { $live[$sid] = $true }
+    # Everything a take-over needs: which kind of holder (a window is ended by
+    # its pid, a background session by `claude stop <id>`), and whether it
+    # says it is busy.
+    if ($alive) {
+      $live[$sid] = @{
+        Kind   = $(if ($a.kind) { ([string]$a.kind).ToLowerInvariant() } else { 'unknown' })
+        State  = $state
+        Status = ([string]$a.status).ToLowerInvariant()
+        Pid    = $(if ($a.pid) { [int]$a.pid } else { 0 })
+        Id     = [string]$a.id
+      }
+    }
   }
   return $live
 }
@@ -633,16 +737,23 @@ function Scan-StrandedSessions {
   }
   $processed = Get-ProcessedSessions
   $live      = Get-LiveSessionIds
+  # A blind probe must not empty this list: Invoke-SessionReconcile reads an
+  # empty result as "nothing stranded" and, once the armed time has passed,
+  # deletes the arming. So the scan carries on as if nothing were live, and the
+  # dispatch guard - which can defer instead of destroy - refuses the resume.
+  if ($null -eq $live) { $live = @{} }
   $found = @()
   foreach ($f in $files) {
     $hit = Find-StrandedSession $f.FullName
     if ($null -eq $hit) { continue }
     if (Test-ProcessedSession $processed $hit.SessionId $hit.LimitTs) { continue }
+    # A live session is a hit like any other. Dropping it here (as this did
+    # until 2026-09-12) meant a window that failed to continue by itself was
+    # never armed at all: eight passes logged "still live" and nothing else
+    # ever happened. The dispatch decides what to do with it.
     if ($live.ContainsKey($hit.SessionId)) {
-      # Not processed and not stranded — just busy. Skipped silently rather than
-      # recorded, so it stays eligible once the process really does go away.
-      Log ("session-rescue: {0} is still live; not a rescue target." -f $hit.SessionId)
-      continue
+      Log ("session-rescue: {0} is live ({1}); watched - taken over if it is still stopped {2} min after the reset." -f
+           $hit.SessionId, $live[$hit.SessionId].Kind, [int]($SessionLiveGraceSeconds / 60))
     }
     $found += $hit
   }
@@ -668,7 +779,9 @@ function Get-BackgroundAgentState([string]$bgId) {
 }
 
 function Get-AgentTranscript([string]$bgId) {
-  # A dispatched agent gets a fresh session id; its transcript is named after it.
+  # A transcript is named after its session id, and the 8-character id the CLI
+  # prints is that id's prefix. Since Claude Code 2.1.257 a resume keeps the
+  # session's id, so this is normally the stopped session's own transcript.
   try {
     return @(Get-ChildItem $script:ProjectsRoot -Directory -ErrorAction SilentlyContinue |
       ForEach-Object { Get-ChildItem $_.FullName -Filter "$bgId*.jsonl" -File -ErrorAction SilentlyContinue })[0]
@@ -694,21 +807,44 @@ function Get-LastAssistantText([string]$path) {
 
 function Get-SessionLabel($hit) {
   # The name a human will scan for in `claude agents`: project folder, then the
-  # time it was resumed. Kept short — the picker truncates — and free of the
+  # time it was resumed. Kept short – the picker truncates – and free of the
   # word "session", which every row already is.
   $leaf = try { Split-Path -Leaf $hit.Cwd } catch { '' }
   if (-not $leaf) { $leaf = 'unknown project' }
-  return ("{0} — resumed {1}" -f $leaf, (Get-Date -Format 'HH:mm'))
+  return ("{0} – resumed {1}" -f $leaf, (Get-Date -Format 'HH:mm'))
+}
+
+function Test-CopyDispatch([string]$sessionId, [string]$bgId) {
+  # True when `--resume <id> --bg` started a COPY instead of continuing the
+  # session. Since Claude Code 2.1.257 it continues under the session's own id
+  # when nothing holds the session, and copies under a new id when something
+  # does. So the id it prints answers "was anything still on this session?"
+  # at the one instant that matters, which no earlier probe can. Read from the
+  # id, not from the wording of its "started a copy" note.
+  if (-not $bgId -or -not $sessionId) { return $false }
+  return -not $sessionId.StartsWith($bgId, [StringComparison]::OrdinalIgnoreCase)
+}
+
+function Remove-CopyDispatch([string]$bgId) {
+  # A copy runs the same work beside whatever holds the original: the parallel
+  # run this tool must never cause. Stop it at once and delete it. Never throws.
+  foreach ($verb in @('stop', 'rm')) {
+    try {
+      $o = ($null | & claude $verb $bgId 2>&1 | Out-String)
+      Add-Content -Path $script:logFile -Value $o -Encoding UTF8
+    } catch {}
+  }
 }
 
 function Invoke-SessionResume($hit) {
   # Dispatched with --bg, NOT -p. A -p run registers no session at all: it never
-  # appears in `claude agents`, so the Claude app — and therefore the user's
-  # phone — cannot show it. Since the terminal that hit the limit can never
+  # appears in `claude agents`, so the Claude app – and therefore the user's
+  # phone – cannot show it. Since the terminal that hit the limit can never
   # update itself, a -p rescue is invisible everywhere, which is exactly what
   # made a working rescue indistinguishable from a broken one. --bg returns
-  # immediately, registers a real background session under a fresh id, and is
-  # watchable and steerable from mobile.
+  # immediately and continues the session in the background under its own id.
+  # If the CLI reports a copy instead, something still holds the session; the
+  # copy is removed and the caller defers (Copy = $true).
   # --name is what makes the result findable. Without it Claude Code names a
   # background session after its prompt, so every resumed session was called
   # "You were interrupted by a usage-limit reset…" — identical for all of them,
@@ -733,7 +869,12 @@ function Invoke-SessionResume($hit) {
   $bgId = ''
   $m = [regex]::Match($out, '(?i)backgrounded\D{0,4}([0-9a-f]{8})')
   if ($m.Success) { $bgId = $m.Groups[1].Value }
-  if (-not $bgId) { return @{ Text = $out; Code = $code; BgId = ''; State = 'unknown'; Summary = '' } }
+  if (-not $bgId) { return @{ Text = $out; Code = $code; BgId = ''; State = 'unknown'; Summary = ''; Copy = $false } }
+  if (Test-CopyDispatch $hit.SessionId $bgId) {
+    Log ("session-rescue: {0} is still held by another process; the CLI started copy {1} - removing it." -f $hit.SessionId, $bgId)
+    Remove-CopyDispatch $bgId
+    return @{ Text = $out; Code = $code; BgId = $bgId; State = 'removed'; Summary = ''; Copy = $true }
+  }
 
   $state = 'running'
   $deadline = (Get-Date).AddSeconds($SessionAgentWaitSeconds)
@@ -746,7 +887,114 @@ function Invoke-SessionResume($hit) {
   $summary = ''
   $tr = Get-AgentTranscript $bgId
   if ($tr) { $summary = Get-LastAssistantText $tr.FullName }
-  return @{ Text = $out; Code = $code; BgId = $bgId; State = $state; Summary = $summary }
+  return @{ Text = $out; Code = $code; BgId = $bgId; State = $state; Summary = $summary; Copy = $false }
+}
+
+function Resolve-LiveStrandedAction($hit, $info, [datetime]$now = (Get-Date)) {
+  # What to do with a session that is stranded AND still held by a process, once
+  # its reset has passed. Pure: decides from what it is given, touches nothing.
+  #
+  #   leave    - someone typed into it after the reset: they are there, and the
+  #              window is theirs to drive;
+  #   defer    - inside the grace after the reset (Claude Code may yet continue
+  #              it by itself), or a holder that says it is busy, inside the
+  #              longer busy grace; or a holder of a kind it cannot end;
+  #   takeover - past the grace and still stopped: end the holder, then
+  #              continue the same session in the background.
+  #
+  # Why take over rather than copy: a copy runs beside the window, and the
+  # window can still continue by itself or be typed into. That happened on
+  # 2026-09-28: a copy made at 00:57 did the night's work, and at 08:19 the
+  # same work was started again in the window that had been left open. Ending
+  # the holder first means one process on the session, ever.
+  #
+  # Graces are measured from the reset, a fixed instant, so a late reconcile
+  # does not restart the clock. When the reset could not be read, the limit
+  # time stands in for it.
+  $anchor = ConvertTo-LocalDateTime $hit.LimitTs
+  if ($null -eq $anchor) { $anchor = $now }
+  $reset = $null
+  try { $reset = Parse-ResetTime $hit.LimitText $anchor } catch {}
+  $since = if ($null -ne $reset) { $reset } else { $anchor }
+  if ($hit.HumanAfterReset) {
+    return @{ Action = 'leave'; Reason = 'someone typed into it after the reset'; Reset = $reset; RetryAt = $null }
+  }
+  $graceEnd = $since.AddSeconds($SessionLiveGraceSeconds)
+  if ($now -lt $graceEnd) {
+    return @{ Action = 'defer'; Reason = ("leaving it to continue by itself until {0:HH:mm}" -f $graceEnd); Reset = $reset; RetryAt = $graceEnd.AddSeconds(30) }
+  }
+  $busyEnd = $since.AddSeconds($SessionBusyGraceSeconds)
+  if ($info.Status -eq 'busy' -and $now -lt $busyEnd) {
+    return @{ Action = 'defer'; Reason = ("it reports busy; waiting until {0:HH:mm}" -f $busyEnd); Reset = $reset; RetryAt = $null }
+  }
+  if (-not (($info.Kind -eq 'interactive' -and $info.Pid) -or ($info.Kind -eq 'background' -and $info.Id))) {
+    return @{ Action = 'defer'; Reason = ("held by a '{0}' process quotawake cannot end" -f $info.Kind); Reset = $reset; RetryAt = $null }
+  }
+  return @{ Action = 'takeover'; Reason = ("still stopped {0:N0} min after the reset" -f ($now - $since).TotalMinutes); Reset = $reset; RetryAt = $null }
+}
+
+function Stop-SessionHolder($info) {
+  # Ends whatever holds a stranded session, so it can be continued without a
+  # copy. A background session is stopped through the CLI, which keeps its
+  # conversation. A window is ended by its pid, and only if that pid still
+  # belongs to a claude process: pids are reused. Returns $true once the holder
+  # is gone. Never throws.
+  try {
+    if ($info.Kind -eq 'background' -and $info.Id) {
+      $o = ($null | & claude stop $info.Id 2>&1 | Out-String)
+      Add-Content -Path $script:logFile -Value $o -Encoding UTF8
+    } elseif ($info.Pid) {
+      $p = Get-Process -Id $info.Pid -ErrorAction SilentlyContinue
+      if ($null -eq $p) { return $true }
+      if ($p.ProcessName -notmatch '^(claude|node)$') {
+        Log ("session-rescue: pid {0} is '{1}', not claude - not ending it." -f $info.Pid, $p.ProcessName)
+        return $false
+      }
+      Stop-Process -Id $info.Pid -Force -ErrorAction Stop
+      try { $p.WaitForExit(15000) | Out-Null } catch {}
+    } else { return $false }
+  } catch {
+    Log ("session-rescue: could not end the holder - " + $_.Exception.Message)
+    return $false
+  }
+  # The CLI's own list is the judge of "gone", not the exit of one process.
+  for ($i = 0; $i -lt 6; $i++) {
+    $live = Get-LiveSessionIds
+    if ($null -ne $live -and -not @($live.Values | Where-Object { ($info.Pid -and $_.Pid -eq $info.Pid) -or ($info.Id -and $_.Id -eq $info.Id) }).Count) { return $true }
+    Start-Sleep -Seconds 5
+  }
+  return $false
+}
+
+# Kept out of the function so tests can assert the exact wording the user sees.
+$script:LeftNoticeTemplate = @'
+
+---
+
+## Left to you – {0}
+
+This session stopped at a usage limit, and someone typed into its window after
+the limit reset, so quotawake has left it alone. If that window is still idle,
+type `continue` in it.
+
+Session `{1}` · limit hit {2} (UTC) · reset announced {3}
+'@
+
+function Write-LeftNotice($hit, $resetAt) {
+  # Same contract as Write-RescueNotice: appended in the project folder, never
+  # throws, returns the path or $null.
+  try {
+    if (-not $hit.Cwd -or -not (Test-Path -LiteralPath $hit.Cwd)) { return $null }
+    $entry = $script:LeftNoticeTemplate -f @(
+      (Get-Date).ToString("yyyy-MM-dd HH:mm")
+      [string]$hit.SessionId
+      [string]$hit.LimitTs
+      $(if ($resetAt) { [string]$resetAt } else { "not parsed" })
+    )
+    $path = Join-Path $hit.Cwd $SessionNoticeFile
+    Add-Content -LiteralPath $path -Value $entry -Encoding UTF8
+    return $path
+  } catch { return $null }
 }
 
 function Show-RescueToast([string]$title, [string]$body) {
@@ -791,91 +1039,97 @@ $toast = [Windows.UI.Notifications.ToastNotification]::new($x)
 }
 
 # Kept out of the function so tests can assert the exact wording the user sees.
+# It leads with what happened and what to do; the details follow for whoever
+# wants them. The earlier version opened with an explanation of two ids and
+# four commands, and the one thing a returning user needs (do nothing, or open
+# it) was in the middle.
 $script:RescueNoticeTemplate = @'
 
 ---
 
-## Resumed automatically — {0}
+## Resumed automatically – {0}
 
-Your session stopped at a usage limit and has been resumed. The window it
-stopped in **cannot be revived** — nothing outside a running Claude Code session
-can type into it — so the conversation was reopened in a **new session**, which
-is why the two ids below differ. It runs in the background, so it also shows up
-in the Claude app, phone included.
+{1}
+
+{2}
 
 | | |
 |---|---|
-| Session that stopped | `{1}` |
-| Resumed session | `{8}` |
-| Limit hit (UTC) | {2} |
-| Reset announced | {3} |
-| Resumed at | {0} |
-| Result | {4} |
-| Desktop notification | {5} |
+| Session | `{3}` – the same session as before, continued in the background |
+| Limit hit (UTC) | {4} |
+| Reset announced | {5} |
+| Desktop notification | {6} |
 
-**This work is already running or done — do not re-run it by hand.** Typing
-`resume` into the old frozen window starts a second run that redoes finished
-work; that cost a duplicated pass on 2026-07-31.
-
-## To go back into the resumed session
-
-    claude agents
-
-It is named after this project and the time it restarted, so it is easy to spot
-in the list. Pick it, press Enter. `qw -List` shows the same thing for
-quotawake's resumes only. Or go straight in, if you have the id:
-
-    claude attach {8}      # open it in this terminal
-    claude logs {8}        # see recent output without opening it
-    claude stop {8}        # stop it now; nothing is lost, reopen it with attach
-
-If the list shows it as `blocked / waiting for permission prompt`, it is not out
-of quota — it is asking for approval and nobody is there. Open it and answer.
-
-## To reopen the session that stopped, instead
-
-    cd "{6}"
-    claude --resume {1}
-
-Both of these must be true or you get `No conversation found`: the old window is
-closed (`--resume` skips a session something still has open), and you are
-standing in the project folder (`--resume` only lists that folder's sessions).
-
-Edits were made under `acceptEdits`, with nobody available to approve them.
+Edits were made under `acceptEdits`, with nobody there to approve them.
 Review them before trusting them.
 
-### What the resumed session reported
+### What the session reported last
 
 {7}
 '@
 
-function Write-RescueNotice($hit, [string]$outText, $resetAt, [string]$result, [bool]$toastShown, [string]$bgId) {
+function Get-ProjectLeaf([string]$cwd) {
+  # The project's folder name for toasts and labels. Never throws, which
+  # Split-Path does on an empty path.
+  if (-not $cwd) { return 'unknown project' }
+  try { $l = Split-Path -Leaf $cwd; if ($l) { return $l } } catch {}
+  return 'unknown project'
+}
+
+function Get-RescueTodo([string]$sessionId, [bool]$resumed) {
+  # The one instruction the notice and the toast give. `qw -Open` needs nothing
+  # looked up: it finds the session for the folder it is run in.
+  $short = if ($sessionId.Length -ge 8) { $sessionId.Substring(0, 8) } else { $sessionId }
+  if ($resumed) {
+    return ("**Nothing to do.** To look in on it, run ``qw -Open`` in this folder, or " +
+            "``claude attach {0}`` from anywhere.") -f $short
+  }
+  return ("**Resume it yourself:** in this folder, run ``claude --resume {0}``. " +
+          "Why it failed is in quotawake.log.") -f $sessionId
+}
+
+function Write-RescueNotice($hit, [string]$outText, $resetAt, [string]$headline, [bool]$toastShown, [bool]$resumed = $true) {
   # Writes the visible sibling for a terminal that can never update itself.
   # Appended, so several rescues in one project stack up in reading order.
-  if (-not (Test-Path -LiteralPath $hit.Cwd)) { return $null }
-  $summary = ""
+  # Never throws: it runs after the rescue, which must not be turned into a
+  # failure by a note that could not be written.
   try {
-    $keep = @($outText -split "`r?`n" | Where-Object { $_.Trim().Length -gt 0 })
-    $summary = ($keep | Select-Object -Last 15) -join "`n"
-  } catch {}
-  if (-not $summary) { $summary = "(the run produced no text output)" }
-  # Built as an explicit array rather than a line-continued -f list: the
-  # continuation form is easy to get subtly wrong and this file is edited rarely
-  # and under pressure. ($fields, not $args — $args is automatic in functions.)
-  $fields = @(
-    (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
-    [string]$hit.SessionId
-    [string]$hit.LimitTs
-    $(if ($resetAt) { [string]$resetAt } else { "not parsed" })
-    $result
-    $(if ($toastShown) { "shown" } else { "unavailable — this file is the only signal" })
-    [string]$hit.Cwd
-    $summary
-    $(if ($bgId) { $bgId } else { "(not dispatched)" })
-  )
-  $entry = $script:RescueNoticeTemplate -f $fields
-  $path = Join-Path $hit.Cwd $SessionNoticeFile
-  try { Add-Content -LiteralPath $path -Value $entry -Encoding UTF8; return $path } catch { return $null }
+    if (-not $hit.Cwd -or -not (Test-Path -LiteralPath $hit.Cwd)) { return $null }
+    $summary = ""
+    try {
+      $keep = @($outText -split "`r?`n" | Where-Object { $_.Trim().Length -gt 0 })
+      $summary = ($keep | Select-Object -Last 15) -join "`n"
+    } catch {}
+    if (-not $summary) { $summary = "(nothing yet)" }
+    # Built as an explicit array rather than a line-continued -f list: the
+    # continuation form is easy to get subtly wrong and this file is edited rarely
+    # and under pressure. ($fields, not $args – $args is automatic in functions.)
+    $fields = @(
+      (Get-Date).ToString("yyyy-MM-dd HH:mm")
+      $headline
+      (Get-RescueTodo ([string]$hit.SessionId) $resumed)
+      [string]$hit.SessionId
+      [string]$hit.LimitTs
+      $(if ($resetAt) { [string]$resetAt } else { "not parsed" })
+      $(if ($toastShown) { "shown" } else { "unavailable – this file is the only signal" })
+      $summary
+    )
+    $entry = $script:RescueNoticeTemplate -f $fields
+    $path = Join-Path $hit.Cwd $SessionNoticeFile
+    Add-Content -LiteralPath $path -Value $entry -Encoding UTF8
+    return $path
+  } catch { return $null }
+}
+
+function Get-StopSince($hit) {
+  # The instant a stop's waiting is measured from: its announced reset, or the
+  # limit time when the reset could not be read. $null if neither parses.
+  $anchor = ConvertTo-LocalDateTime $hit.LimitTs
+  if ($null -eq $anchor) { return $null }
+  $reset = $null
+  try { $reset = Parse-ResetTime $hit.LimitText $anchor } catch {}
+  if ($null -ne $reset) { return $reset }
+  return $anchor
 }
 
 function Invoke-SessionReconcile {
@@ -885,7 +1139,7 @@ function Invoke-SessionReconcile {
       # An arming is NOT thrown away just because one pass saw nothing. This
       # pass runs every 15 minutes against files a live TUI is still appending
       # to, so an empty result can mean "scan raced the writer" as easily as
-      # "session recovered" — and disarming on it is unrecoverable. That is
+      # "session recovered" – and disarming on it is unrecoverable. That is
       # precisely how the 19:20 reset died on 2026-07-25: armed correctly at
       # 18:07, then one empty scan at 19:25 unregistered the task instead of
       # letting it fire. The one-shot costs nothing to keep and re-checks each
@@ -904,16 +1158,6 @@ function Invoke-SessionReconcile {
       Log "session-rescue: nothing stranded and the armed time has passed - clearing state."
       Clear-SessionsState
     }
-    return
-  }
-
-  $st = Load-SessionsState
-  $attempt = 0
-  if ($st -and $st.attempt) { $attempt = [int]$st.attempt }
-  if ($attempt -ge $SessionMaxAttempts) {
-    Log "session-rescue: still limited after $attempt attempts - giving up on this batch."
-    foreach ($h in $stranded) { Add-ProcessedSession $h.SessionId $h.LimitTs $h.Cwd '' 'gave up after 8 attempts' }
-    Clear-SessionsState
     return
   }
 
@@ -938,10 +1182,11 @@ function Invoke-SessionReconcile {
   if ($due.Count -eq 0) {
     # Window still shut for all of them: keep the state fresh so the watcher
     # holds the machine awake (on AC), make sure the punctual one-shot exists,
-    # and stay quiet otherwise — this path runs every 15 minutes.
+    # and stay quiet otherwise – this path runs every 15 minutes.
+    $st = Load-SessionsState
     $prevFire = $null
     if ($st) { try { $prevFire = Get-StateFireAt $st } catch {} }
-    Save-SessionsState $latestFire $stranded $attempt
+    Save-SessionsState $latestFire $stranded
     $existing = Test-ScheduledJob $SessionsFireTaskName
     if (-not $existing -or $null -eq $prevFire -or [math]::Abs(($latestFire - $prevFire).TotalSeconds) -gt 60) {
       Register-SessionsFireTask $latestFire
@@ -951,73 +1196,155 @@ function Invoke-SessionReconcile {
   }
 
   Log ("session-rescue: reset reached - resuming {0} session(s)." -f $due.Count)
+  # Each deferral may name when it wants to be looked at again; the earliest
+  # wins, and none waits longer than a poll interval.
+  $script:DeferRetryAt = @()
   $deferred = 0
+  # One probe for the whole pass, taken here rather than reused from the scan:
+  # the scan can be twenty minutes old, and what matters is who holds the
+  # session in the seconds before it is continued.
+  $liveNow = Get-LiveSessionIds
   foreach ($h in ($due | Sort-Object { $_.LimitTs })) {
-    # Re-check right before firing: a TUI left open auto-continues ~3 minutes
-    # after the reset, and that must win over a headless fork.
+    # Re-check right before firing: a window that continued by itself in the
+    # meantime must win over a resume.
     $fresh = Find-StrandedSession $h.Transcript
     if ($null -eq $fresh -or $fresh.LimitTs -ne $h.LimitTs) {
       Log ("session-rescue: {0} already moved on by itself - skipping." -f $h.SessionId)
       Add-ProcessedSession $h.SessionId $h.LimitTs $h.Cwd '' 'continued on its own'
       continue
     }
-    if (-not (Test-Path -LiteralPath $h.Cwd)) {
-      # Do NOT write the session off here. A project can live under a
-      # cloud-sync or network mount, where an unreachable folder usually means
-      # the drive is unmounted or still coming up — a temporary condition, not
-      # a deleted project. Marking it processed would
-      # forfeit the rescue permanently over a transient mount, so defer and let
-      # the attempt counter below bound the retries.
-      Log ("session-rescue: {0}: project folder '{1}' not reachable right now - deferring." -f $h.SessionId, $h.Cwd)
+    $h = $fresh
+
+    # Every deferral below is harmless and costs nothing but a later look. The
+    # one limit on them is the stop's age: a session still stopped a day after
+    # its reset is written off, with a note saying so. That is per session, so
+    # one session that keeps deferring cannot write off another.
+    $since = Get-StopSince $h
+    $tooOld = ($null -ne $since -and (Get-Date) -gt $since.AddHours($SessionGiveUpHours))
+
+    # Is anything writing the file? This one owes nothing to the CLI, which is
+    # why it runs first: a continuation writes as it goes, while a stranded
+    # session's last write was its own stop line, hours ago.
+    $writtenAgo = $null
+    try { $writtenAgo = ((Get-Date) - (Get-Item -LiteralPath $h.Transcript).LastWriteTime).TotalSeconds } catch {}
+    $why = $null; $retryAt = $null
+    if ($null -ne $writtenAgo -and $writtenAgo -lt $SessionLiveWriteSeconds) {
+      $why = ("transcript written {0:N0}s ago - something is on it" -f $writtenAgo)
+    }
+
+    $takenOver = $false
+    $info = $null
+    if (-not $why -and $null -ne $liveNow -and $liveNow.ContainsKey($h.SessionId)) {
+      $info = $liveNow[$h.SessionId]
+      $verdict = Resolve-LiveStrandedAction $h $info
+      switch ($verdict.Action) {
+        'leave' {
+          Log ("session-rescue: {0} is live and {1} - leaving it to them." -f $h.SessionId, $verdict.Reason)
+          Add-ProcessedSession $h.SessionId $h.LimitTs $h.Cwd '' 'left to you' 'left to you'
+          [void](Write-LeftNotice $h $verdict.Reset)
+          $why = 'left'
+        }
+        'defer' { $why = ("live ({0}) - {1}" -f $info.Kind, $verdict.Reason); $retryAt = $verdict.RetryAt }
+        'takeover' {
+          Log ("session-rescue: {0} is live ({1}) and {2} - ending the holder to continue it in the background." -f $h.SessionId, $info.Kind, $verdict.Reason)
+          if (Stop-SessionHolder $info) { $takenOver = $true }
+          else { $why = "its holder could not be ended" }
+        }
+      }
+    } elseif (-not $why -and $null -eq $liveNow) {
+      # A blind probe used to defer every resume (all seven on 2026-09-13). It
+      # need not: if anything still holds the session, the dispatch below gets
+      # a copy instead of the session, and removes it at once.
+      Log ("session-rescue: {0}: could not list running sessions - resuming anyway; a copy would be caught and removed." -f $h.SessionId)
+    }
+    # `continue` inside a switch only leaves the switch, so the hand-off to the
+    # user is acted on here.
+    if ($why -eq 'left') { continue }
+    # Do NOT write a session off over an unreachable folder. A project can live
+    # under a cloud-sync or network mount, where an unreachable folder usually
+    # means the drive is unmounted or still coming up: a temporary condition,
+    # not a deleted project.
+    if (-not $why -and (-not $h.Cwd -or -not (Test-Path -LiteralPath $h.Cwd))) {
+      $why = ("project folder '{0}' not reachable right now" -f $h.Cwd)
+    }
+
+    $r = $null
+    if (-not $why) {
+      $r = Invoke-SessionResume $h
+      if ($r.Copy) {
+        # Recorded under the copy's own id, so its transcript – which carries
+        # this very stop line – is never mistaken for a session to rescue.
+        Add-ProcessedSession $r.BgId $h.LimitTs $h.Cwd '' 'copy removed' 'discarded copy'
+        $why = "something still holds it (the CLI made a copy, now removed)"
+      }
+    }
+
+    if ($why) {
+      if ($tooOld) {
+        Log ("session-rescue: {0}: {1}; still stopped {2} h after its reset - giving up on it." -f $h.SessionId, $why, $SessionGiveUpHours)
+        Add-ProcessedSession $h.SessionId $h.LimitTs $h.Cwd '' 'gave up' 'gave up'
+        $headline = ("quotawake gave up on this session: it was still stopped {0} hours after the limit reset ({1})." -f $SessionGiveUpHours, $why)
+        $toast = Show-RescueToast "Claude session not resumed" ("{0}: {1}" -f (Get-ProjectLeaf $h.Cwd), "quotawake gave up; see QUOTAWAKE-RESUMED.md")
+        [void](Write-RescueNotice $h '' $since $headline $toast $false)
+        continue
+      }
+      Log ("session-rescue: {0}: {1}; deferring." -f $h.SessionId, $why)
+      if ($retryAt) { $script:DeferRetryAt += $retryAt }
       $deferred++
       continue
     }
-    $r = Invoke-SessionResume $h
+
     Add-ProcessedSession $h.SessionId $h.LimitTs $h.Cwd $r.BgId (Get-SessionLabel $h)
-    if ($r.Code -ne 0 -or -not $r.BgId) {
+    $resumed = ($r.Code -eq 0 -and $r.BgId)
+    if (-not $resumed) {
       Log ("session-rescue: {0} dispatch failed (exit {1}) - see output above; not retrying." -f $h.SessionId, $r.Code)
-      $result = "dispatch failed (exit $($r.Code)) — see quotawake.log"
+      $headline = "quotawake could not resume this session (exit $($r.Code))."
     } else {
-      # An agent that re-limits immediately strands its own transcript. Ask the
-      # same detector rather than scraping text — with --bg the dispatch exits 0
-      # long before the agent knows whether the window reopened, so the old
-      # "non-zero exit + limit marker" test can no longer see a re-limit. The
-      # next 15-minute pass arms the new transcript under its own reset.
+      # A re-limit is a NEWER stop. The transcript still holds the stop that was
+      # just handled – a resume keeps the session's id and its transcript – and
+      # an agent that has not finished its first tool call yet still looks
+      # stranded on it. Reading that old stop as a new one reported "hit the
+      # limit again" on 9 of 11 resumes between 2026-09-13 and 2026-10-19.
       $reStranded = $null
       $tr = Get-AgentTranscript $r.BgId
       if ($tr) { $reStranded = Find-StrandedSession $tr.FullName }
-      if ($reStranded) {
-        $result = "hit the limit again — agent $($r.BgId) is stranded; the next pass re-arms it"
-        Log ("session-rescue: dispatched agent {0} hit the limit again; the next scan will arm it." -f $r.BgId)
+      if ($reStranded -and $reStranded.LimitTs -ne $h.LimitTs) {
+        $headline = "The session continued, then hit another usage limit. quotawake continues it again after that reset."
+        Log ("session-rescue: {0} hit a new limit; the next scan arms it." -f $h.SessionId)
       } elseif ($r.State -in @('done', 'completed')) {
-        $result = "finished cleanly (agent $($r.BgId))"
-        Log ("session-rescue: {0} resumed as background agent {1}; finished cleanly." -f $h.SessionId, $r.BgId)
+        $headline = "The session continued after the limit and has finished."
+        Log ("session-rescue: {0} continued in the background as {1}; finished." -f $h.SessionId, $r.BgId)
       } elseif ($r.State -in @('failed', 'error', 'stopped')) {
-        $result = "agent $($r.BgId) ended '$($r.State)' — check with: claude logs $($r.BgId)"
-        Log ("session-rescue: {0} resumed as background agent {1}; ended '{2}'." -f $h.SessionId, $r.BgId, $r.State)
+        $headline = ("The session continued, then ended '{0}'. ``claude logs {1}`` shows its last output." -f $r.State, $r.BgId)
+        Log ("session-rescue: {0} continued in the background as {1}; ended '{2}'." -f $h.SessionId, $r.BgId, $r.State)
       } else {
-        $result = "still running as agent $($r.BgId) — watch it in the Claude app"
-        Log ("session-rescue: {0} resumed as background agent {1}; still running." -f $h.SessionId, $r.BgId)
+        $headline = "The session is continuing in the background."
+        Log ("session-rescue: {0} continued in the background as {1}; still running." -f $h.SessionId, $r.BgId)
+      }
+      if ($takenOver) {
+        $what = if ($info.Kind -eq 'interactive') { 'Its window was still open but idle' } else { 'It was still held by a stopped background run' }
+        $headline = ("{0} after the reset, so quotawake closed it and continued the same session in the background. Nothing runs twice. {1}" -f $what, $headline)
       }
     }
 
     # Surface it. Everything above this point can succeed perfectly and still
     # look like nothing happened, because the window the user is staring at is
     # a stale view that no longer receives anything.
-    $toast = Show-RescueToast "Claude session resumed" (
-      "{0} — {1}. Do not re-run by hand." -f (Split-Path $h.Cwd -Leaf), $result)
-    $noticeReset = $null
-    try { $noticeReset = Parse-ResetTime $h.LimitText (ConvertTo-LocalDateTime $h.LimitTs) } catch {}
+    $toastBody = if ($resumed) { "{0}: continuing in the background. Run qw -Open in that folder to look in." -f (Get-ProjectLeaf $h.Cwd) }
+                 else          { "{0}: could not be resumed. See QUOTAWAKE-RESUMED.md." -f (Get-ProjectLeaf $h.Cwd) }
+    $toast = Show-RescueToast $(if ($resumed) { "Claude session resumed" } else { "Claude session not resumed" }) $toastBody
     $noticeBody = if ($r.Summary) { $r.Summary } else { $r.Text }
-    $notice = Write-RescueNotice $h $noticeBody $noticeReset $result $toast $r.BgId
+    $notice = Write-RescueNotice $h $noticeBody (Get-StopSince $h) $headline $toast $resumed
     if ($notice) { Log ("session-rescue: notice written to {0} (toast: {1})." -f $notice, $(if ($toast) { "shown" } else { "unavailable" })) }
     else { Log ("session-rescue: could not write the notice file into {0}." -f $h.Cwd) }
   }
   if ($deferred -gt 0) {
     $retryAt = (Get-Date).AddMinutes($PollMinutes)
-    Save-SessionsState $retryAt $stranded ($attempt + 1)
+    foreach ($t in $script:DeferRetryAt) { if ($t -lt $retryAt -and $t -gt (Get-Date)) { $retryAt = $t } }
+    Save-SessionsState $retryAt $stranded
     Register-SessionsFireTask $retryAt
-    Log ("session-rescue: {0} session(s) deferred on an unreachable folder; retrying at {1} (attempt {2} of {3})." -f $deferred, $retryAt, ($attempt + 1), $SessionMaxAttempts)
+    # The reason is on its own line above, one per session.
+    Log ("session-rescue: {0} session(s) deferred; retrying at {1}." -f $deferred, $retryAt)
     return
   }
   if (@(Scan-StrandedSessions).Count -eq 0) { Clear-SessionsState }
@@ -1180,6 +1507,20 @@ function Set-WatcherAutostart([switch]$Remove) {
   )
 }
 
+function Select-ResumedRow($rows, [string]$here) {
+  # The ledger row `qw -Open` opens: the newest resume for the folder it is run
+  # in (or a folder containing it), else the newest resume of all. Pure.
+  $rows = @($rows | Where-Object { $_.resumedAs })
+  if (-not $rows.Count) { return $null }
+  $h = ([string]$here).TrimEnd('\', '/').ToLowerInvariant()
+  $mine = @($rows | Where-Object {
+    $pp = ([string]$_.projectPath).TrimEnd('\', '/').ToLowerInvariant()
+    $pp -and ($h -eq $pp -or $h.StartsWith($pp + '\'))
+  })
+  if ($mine.Count) { return $mine[-1] }
+  return $rows[-1]
+}
+
 # --- when dot-sourced for testing, stop here: functions + $limitPattern defined ---
 if ($SelfTest) { return }
 
@@ -1226,10 +1567,39 @@ if ($List) {
     Write-Host ("  {0,-16}  {1,-22}  {2,-10}  {3}" -f $when, $proj, $short, $state)
   }
   Write-Host ""
-  Write-Host "  Go back into one:   claude attach <session>"
-  Write-Host "  Or pick from a list: claude agents"
+  Write-Host "  Open the one for this folder:  qw -Open"
+  Write-Host "  Or any of them by id:         claude attach <session>"
   Write-Host ""
   exit 0
+}
+
+if ($Open) {
+  # The step after a rescue, without reading anything first: run it in the
+  # project folder and you are in the session.
+  $row = Select-ResumedRow (Get-ProcessedSessions) (Get-Location).Path
+  if (-not $row) { Write-Host "quotawake has not resumed anything yet."; exit 0 }
+  $id = [string]$row.resumedAs
+  # A resume keeps the stopped session's id (Claude Code 2.1.257+), so the full
+  # id is the stopped one. A copy made before that has an id of its own.
+  $full = if (([string]$row.stoppedId).StartsWith($id)) { [string]$row.stoppedId }
+          else { $tr = Get-AgentTranscript $id; if ($tr) { $tr.BaseName } else { '' } }
+  $when = ConvertTo-LocalDateTime $row.handled
+  Write-Host ("{0}, resumed {1}  (session {2})" -f $row.project, $(if ($when) { $when.ToString('yyyy-MM-dd HH:mm') } else { '?' }), $id)
+  $held = Get-LiveSessionIds
+  $info = if ($held -and $full) { $held[$full] } else { $null }
+  if ($info -and $info.Kind -eq 'interactive') {
+    Write-Host "It is open in another terminal window; switch to that one."
+    exit 0
+  }
+  if ($info -or -not $full -or -not $row.projectPath -or -not (Test-Path -LiteralPath $row.projectPath)) {
+    & claude attach $id
+    exit $LASTEXITCODE
+  }
+  # Finished or stopped: reopen the conversation from its own folder, which is
+  # the only place `--resume` finds it.
+  Set-Location -LiteralPath $row.projectPath
+  & claude --resume $full
+  exit $LASTEXITCODE
 }
 
 $script:DoctorFailures = 0
@@ -1248,6 +1618,27 @@ if ($Doctor) {
   $claude = Get-Command claude -ErrorAction SilentlyContinue
   Test-Doctor "claude CLI on PATH" ([bool]$claude) $(if ($claude) { $claude.Source } else { 'not found - rescue cannot run' })
   Test-Doctor "transcripts folder" (Test-Path -LiteralPath $script:ProjectsRoot) $script:ProjectsRoot
+
+  # The rescue is only safe on a Claude Code that resumes a session under its
+  # own id: an older one copies it, and the copy works beside the original.
+  if ($claude) {
+    $ver = $null
+    try { $m = [regex]::Match((& claude --version 2>$null | Out-String), '(\d+\.\d+\.\d+)'); if ($m.Success) { $ver = [version]$m.Groups[1].Value } } catch {}
+    Test-Doctor "Claude Code $MinClaudeVersion or later" ($null -ne $ver -and $ver -ge $MinClaudeVersion) `
+      $(if ($ver) { "$ver" + $(if ($ver -lt $MinClaudeVersion) { ' - resumes would copy sessions; run: claude update' } else { '' }) } else { 'version unreadable' })
+    # The list of running sessions is how a held session is found and taken
+    # over. Without it a held session is still caught at dispatch, by the copy
+    # the CLI reports, but only after that copy has started.
+    $agents = Get-AgentList
+    Test-Doctor "running sessions readable" ($null -ne $agents) `
+      $(if ($null -ne $agents) { "claude agents --json: $(@($agents).Count) session(s)" } else { 'claude agents --json --all gave no JSON' }) -Warn:($null -eq $agents)
+  }
+  # An open window is first given the chance to continue by itself. With this
+  # setting off, every open window waits out the grace and is then taken over.
+  $auto = $null
+  try { $auto = (Get-Content -Raw -LiteralPath (Join-Path $env:USERPROFILE '.claude\settings.json') | ConvertFrom-Json).autoContinueAtUsageLimit } catch {}
+  Test-Doctor "Claude's own auto-continue" ($auto -ne $false) `
+    $(if ($auto -eq $false) { 'off in ~/.claude/settings.json; open windows will be taken over instead' } else { 'not turned off' }) -Warn:($auto -eq $false)
 
   # The scheduler is the one piece that cannot be faked: without it nothing ever
   # fires, and that failure is silent, so prove it by actually registering.
