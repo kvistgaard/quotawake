@@ -34,11 +34,14 @@ You had to come back and type, or use a tool like quotawake.
 
 Claude Code now [waits in the open window and continues the task after the
 reset](https://code.claude.com/docs/en/interactive-mode#wait-for-a-usage-limit-to-reset).
-It does not continue the task when:
-- you closed the window, or Claude Code exited
-- the computer slept through the reset for more than about 30 minutes
-- the session runs in the background
-- the continued task keeps hitting the limit
+It does not continue the task 
+- always when:
+	- you closed the window, or Claude Code exited
+	- the computer slept through the reset for more than about 30 minutes
+	- the session runs in the background
+	- the continued task keeps hitting the limit,
+- and sometimes when:
+	- the windows is open and yet the sessions does not resume (don't know yet why)
 quotawake resumes the session in these cases. In an open window it waits ten
 minutes after the reset, so that Claude Code can continue the task first.
 
